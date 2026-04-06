@@ -1,0 +1,34 @@
+services:
+  coding-agent:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      # Persist long-term memory across restarts
+      - agent-memory:/root/.coding_agent/memory
+      # Mount working directory for file operations
+      - ./workspace:/workspace
+    restart: unless-stopped
+
+  # Optional: Local LLM via Ollama
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles:
+      - with-ollama
+
+volumes:
+  agent-memory:
+  ollama-models:
