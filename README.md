@@ -75,6 +75,48 @@ python -m coding_agent
 
 모델 실패 시 자동으로 다음 모델로 전환됩니다. Circuit Breaker: 3회 연속 실패 시 5분간 해당 모델 스킵.
 
+## Testing
+
+### WebUI 테스트 (사이드바 Test Prompts)
+
+WebUI Chat 페이지의 사이드바에 내장된 테스트 프롬프트를 사용할 수 있습니다.
+
+| 테스트 | 프롬프트 | 확인 사항 |
+|--------|----------|-----------|
+| **SubAgent** | `Analyze the following task by spawning sub-agents: 1) A researcher to investigate best practices for Python error handling, 2) A code_writer to write an example implementation` | 화면 자동 분할, 2개 SubAgent 생성/실행/소멸, Event Timeline |
+| **Memory** | `Remember that I prefer Python type hints and Google-style docstrings. Then search memory to confirm it was saved.` | `memory_store` → `memory_search` 호출, Memory 대시보드에서 확인 |
+| **Multi-Agent** | `I need you to: spawn a code_writer to create a fibonacci function, then spawn a reviewer to review the code quality` | 순차 SubAgent 생성, reviewer가 code_writer 결과를 참조 |
+| **Fallback** | `Write a simple hello world in Python` | 정상 응답, 사용된 모델명 표시 |
+
+### CLI 테스트
+
+```bash
+python -m coding_agent
+
+# 1. SubAgent 테스트
+You> Create a fibonacci function using a code_writer subagent, then have a reviewer check it
+
+# 2. Memory 테스트
+You> Remember that my project uses FastAPI and PostgreSQL
+You> What do you know about my project setup?
+
+# 3. Fallback 테스트 (API 키 없이 실행 → Ollama로 자동 전환)
+You> Write hello world
+
+# 4. 상태 확인 명령어
+You> /status     # 모델별 Circuit Breaker 상태
+You> /memory     # 메모리 카테고리별 통계
+You> /subagents  # SubAgent 실행 이력
+```
+
+### 기능별 검증 체크리스트
+
+- [ ] **장기 메모리**: 대화 후 Memory 대시보드에서 저장 확인 → 새 세션에서 recall 가능
+- [ ] **모델 Fallback**: OpenRouter API 키 제거 시 → Ollama로 자동 전환 확인
+- [ ] **SubAgent 라이프사이클**: Chat 화면 자동 분할 → 각 Agent 카드 상태 전환 (⏳→🔄→✅)
+- [ ] **Agentic Loop 방어**: 25회 이상 반복 시 자동 종료 확인
+- [ ] **WebUI**: Chat, Memory, SubAgent, Settings 4개 페이지 정상 렌더링
+
 ## Project Structure
 
 ```
