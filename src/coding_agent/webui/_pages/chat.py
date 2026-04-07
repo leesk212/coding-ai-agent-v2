@@ -57,7 +57,7 @@ def _esc(text: str) -> str:
     (both ``"node label"`` and ``|"edge label"|``).
 
     Aggressively strips anything that could break Mermaid syntax.
-    Only allows basic alphanumeric, spaces, Korean, and safe punctuation.
+    Mermaid source is kept ASCII-only to avoid browser btoa() failures.
     """
     import re
     # First pass: basic replacements
@@ -90,7 +90,9 @@ def _esc(text: str) -> str:
     )
     # Collapse multiple spaces
     t = re.sub(r"\s+", " ", t).strip()
-    return t
+    # Mermaid may call window.btoa() internally, which fails on non-Latin1 text.
+    # Keep the diagram source ASCII-only; full text remains available elsewhere.
+    return t.encode("ascii", "ignore").decode("ascii")
 
 
 def _escape_html(text: str) -> str:
@@ -106,6 +108,29 @@ def _escape_html(text: str) -> str:
     )
 
 
+def _escape_bubble_html(text: str) -> str:
+    """Escape assistant/user message HTML while preserving line breaks."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+        .replace("\r", "")
+        .replace("\n", "<br>")
+    )
+
+
+def _edge_label(text: str, fallback: str, limit: int = 28) -> str:
+    """Return a short Mermaid-safe edge label."""
+    safe = _esc(text or "")
+    if not safe:
+        return fallback
+    if len(safe) > limit:
+        return safe[:limit].rstrip() + "..."
+    return safe
+
+
 def _build_mermaid(
     agents: list[dict],
     is_working: bool,
@@ -115,8 +140,8 @@ def _build_mermaid(
 ) -> tuple[str, dict[str, str]]:
     """Return a (mermaid_definition, tooltips) tuple.
 
-    ★ Edge labels use ONLY safe, hardcoded short text — never raw AI output.
-       AI 응답 내용은 말풍선에서 보여주므로 Mermaid에는 흐름만 표시.
+    Edge labels show short sanitised prompt/result previews.
+    Full prompt/result text is exposed through browser tooltips.
 
     Nodes:
       U  = User  (stadium shape)
@@ -127,7 +152,7 @@ def _build_mermaid(
     lines = ["graph LR"]
 
     # ── User ──────────────────────────────────────────────
-    lines.append('    U(["👤 User"])')
+    lines.append('    U(["User"])')
 
     # ── Main Agent ────────────────────────────────────────
     if has_result:
@@ -139,36 +164,37 @@ def _build_mermaid(
         m_detail = "Processing"
     else:
         m_detail = "Idle"
-    lines.append(f'    M["🧠 Main Agent<br/><small>{m_detail}</small>"]')
+    lines.append(f'    M["Main Agent<br/><small>{m_detail}</small>"]')
 
     # ── User → Main edge (prompt은 짧은 요약만) ──────────
     if prompt_text:
-        safe_p = _esc(prompt_text[:20])
-        if len(prompt_text) > 20:
-            safe_p += "…"
+        safe_p = _edge_label(prompt_text, "user prompt", limit=24)
         lines.append(f'    U -->|"{safe_p}"| M')
     else:
         lines.append("    U --> M")
 
     # ── SubAgents ─────────────────────────────────────────
     for i, a in enumerate(agents):
-        icon = AGENT_ICONS.get(a["type"], "🤖")
         detail = a["status"]
         if a.get("elapsed"):
             detail += f" {a['elapsed']}s"
 
         nid = f"S{i}"
-        label = f"{icon} {a['type']}<br/><small>{detail}</small>"
+        label = f"{_esc(a['type'])}<br/><small>{detail}</small>"
         lines.append(f'    {nid}["{label}"]')
 
-        # Main → SubAgent edge: type name only
-        lines.append(f'    M --> {nid}')
+        prompt_label = _edge_label(a.get("query", ""), f"{a['type']} task")
+        result_label = _edge_label(a.get("result_summary", ""), "result")
 
-        # SubAgent → Main feedback: simple status only
+        # Main → SubAgent edge: prompt preview
+        lines.append(f'    M -->|"{prompt_label}"| {nid}')
+
+        # SubAgent → Main feedback: result/error preview
         if a["status"] == "completed":
-            lines.append(f'    {nid} -.->|"done"| M')
+            lines.append(f'    {nid} -.->|"{result_label}"| M')
         elif a["status"] == "failed":
-            lines.append(f'    {nid} -.->|"failed"| M')
+            error_label = _edge_label(a.get("result_summary", ""), "failed")
+            lines.append(f'    {nid} -.->|"{error_label}"| M')
 
     # ── Main Agent → User (완료 시) ──────────────────────
     if has_result:
@@ -209,13 +235,16 @@ def _build_mermaid(
     # JS looks up edge labels by their displayed text, not node IDs
     tooltips: dict[str, str] = {}
     if prompt_text:
-        safe_p = _esc(prompt_text[:20])
-        if len(prompt_text) > 20:
-            safe_p += "…"
-            tooltips[safe_p] = prompt_text
+        safe_p = _edge_label(prompt_text, "user prompt", limit=24)
+        tooltips[safe_p] = prompt_text
     for i, a in enumerate(agents):
+        prompt_label = _edge_label(a.get("query", ""), f"{a['type']} task")
+        if a.get("query"):
+            tooltips[prompt_label] = a["query"]
+
         if a.get("result_summary"):
-            tooltips["done"] = a["result_summary"][:200]
+            result_label = _edge_label(a.get("result_summary", ""), "result")
+            tooltips[result_label] = a["result_summary"][:500]
 
     return "\n".join(lines), tooltips
 
@@ -225,6 +254,7 @@ def _build_page_html(
     events: list[dict],
     is_working: bool,
     tooltips: dict[str, str] | None = None,
+    render_id: int = 0,
 ) -> str:
     """Build a self-contained HTML page with Mermaid chart + Event Feed.
 
@@ -256,6 +286,10 @@ def _build_page_html(
         _sv = _sv.replace("</", "<\\/")
         _safe_tips[_k] = _sv
     tooltip_json = _json.dumps(_safe_tips, ensure_ascii=True)
+    mermaid_json = _json.dumps(
+        mermaid_def.replace("\r", "").replace("\x00", "").replace("</", "<\\/"),
+        ensure_ascii=True,
+    )
 
     # Optional CSS pulse for "working" state
     pulse_css = """
@@ -263,11 +297,19 @@ def _build_page_html(
         0%,100% { filter: drop-shadow(0 0 2px rgba(22,163,74,.15)); }
         50%     { filter: drop-shadow(0 0 14px rgba(22,163,74,.45)); }
     }
+    @keyframes flow {
+        from { stroke-dashoffset: 12; }
+        to   { stroke-dashoffset: 0; }
+    }
     .mermaid svg { animation: pulse 1.8s ease-in-out infinite; }
+    .mermaid .edgePaths path {
+        stroke-dasharray: 6 6;
+        animation: flow 1s linear infinite;
+    }
     """ if is_working else ""
 
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
+<html data-render-id="{render_id}"><head><meta charset="utf-8">
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
@@ -292,6 +334,13 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 .ev.done{{border-left-color:#22c55e}}
 .ev.error{{border-left-color:#ef4444}}
 .ev .ts{{color:#94a3b8;font-family:monospace;font-size:9px;margin-right:4px}}
+.mermaid-error{{display:none;margin:8px 0 10px;padding:10px 12px;
+  border:1px solid #fecaca;border-radius:10px;background:#fef2f2;color:#991b1b;
+  font-size:11px;line-height:1.45;text-align:left;white-space:pre-wrap}}
+.mermaid-error-title{{font-weight:700;margin-bottom:6px}}
+.mermaid-error pre{{margin-top:6px;max-height:180px;overflow:auto;
+  color:#7f1d1d;background:#fff1f2;border:1px solid #fecdd3;border-radius:6px;
+  padding:8px;font-size:10px;white-space:pre-wrap}}
 </style>
 </head>
 <body>
@@ -299,6 +348,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 <pre class="mermaid">
 {mermaid_def}
 </pre>
+<div id="mermaid-error" class="mermaid-error"></div>
 
 <div class="evts" id="ev">
   {events_html}
@@ -306,7 +356,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 
 <script>
 mermaid.initialize({{
-  startOnLoad:true,
+  startOnLoad:false,
   theme:'base',
   themeVariables:{{
     fontFamily:'-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
@@ -327,6 +377,28 @@ document.getElementById('ev').scrollTop=
 
 // ── Tooltip injection: hover on truncated edge labels to see full text ──
 var _tooltips = {tooltip_json};
+var _mermaidSource = {mermaid_json};
+function _showMermaidError(err) {{
+  var detail = err && (err.stack || err.message || String(err)) || "Unknown Mermaid error";
+  console.error("[CodingAgent Mermaid] render failed", err);
+  console.error("[CodingAgent Mermaid] source:\\n" + _mermaidSource);
+  var box = document.getElementById("mermaid-error");
+  if(box) {{
+    box.style.display = "block";
+    box.innerHTML =
+      '<div class="mermaid-error-title">Mermaid rendering failed. Open browser console for full logs.</div>' +
+      '<div><b>Error</b></div><pre></pre>' +
+      '<div><b>Mermaid source</b></div><pre></pre>';
+    var pres = box.querySelectorAll("pre");
+    pres[0].textContent = detail;
+    pres[1].textContent = _mermaidSource;
+  }}
+}}
+window.addEventListener("error", function(event) {{
+  if(String(event.message || "").toLowerCase().includes("mermaid")) {{
+    _showMermaidError(event.error || event.message);
+  }}
+}});
 mermaid.run().then(function(){{
   document.querySelectorAll('.edgeLabel span, .edgeLabel p, .edgeLabel div, .edgeLabel foreignObject span').forEach(function(el){{
     var txt = (el.textContent||'').trim();
@@ -335,7 +407,7 @@ mermaid.run().then(function(){{
       el.style.cursor = 'help';
     }}
   }});
-}}).catch(function(){{}});
+}}).catch(_showMermaidError);
 </script>
 </body></html>"""
 
@@ -348,18 +420,32 @@ def _render_mermaid(
     num_agents: int = 0,
     tooltips: dict[str, str] | None = None,
 ) -> None:
-    """Render Mermaid flowchart + event feed inside an iframe.
-
-    Uses Streamlit 1.56+ st.iframe() which accepts raw HTML strings directly
-    (auto-detected as srcdoc). The Mermaid CDN script loads naturally inside
-    the iframe sandbox, avoiding DOMPurify sanitisation issues with st.html().
-
-    No 'scrolling' kwarg — the new st.iframe API removed it.
-    """
-    html = _build_page_html(mermaid_def, events, is_working, tooltips=tooltips)
+    """Render Mermaid flowchart + event feed inside an iframe."""
     h = max(420, 260 + num_agents * 70)
-    with placeholder:
-        st.iframe(html, height=h)
+    st.session_state["_mermaid_render_seq"] = (
+        st.session_state.get("_mermaid_render_seq", 0) + 1
+    )
+    render_id = st.session_state["_mermaid_render_seq"]
+    html = _build_page_html(
+        mermaid_def,
+        events,
+        is_working,
+        tooltips=tooltips,
+        render_id=render_id,
+    )
+    print(
+        "[CodingAgent Mermaid] render",
+        render_id,
+        "working=",
+        is_working,
+        "agents=",
+        num_agents,
+        "events=",
+        len(events),
+        flush=True,
+    )
+    placeholder.empty()
+    placeholder.iframe(html, height=h)
 
 
 # ─────────────────────────────────────────────────────────
@@ -400,8 +486,31 @@ def _stream_response(
     # Local SubAgent tracking — 질의별 독립 (registry는 세션 공유이므로 사용하지 않음)
     tracked_agents: list[dict] = []
     _sa_counter = [0]  # mutable counter for unique IDs
+    tool_call_agents: dict[str, int] = {}
 
     # ── helpers ───────────────────────────────────────────
+
+    def _tool_call_value(tool_call, key: str, default=None):
+        if isinstance(tool_call, dict):
+            return tool_call.get(key, default)
+        return getattr(tool_call, key, default)
+
+    def _is_subagent_tool(tool_name: str) -> bool:
+        return tool_name in ("spawn_subagent", "task")
+
+    def _subagent_args(tool_name: str, args) -> tuple[str, str]:
+        """Normalize custom and DeepAgents native subagent tool arguments."""
+        if not isinstance(args, dict):
+            return "general", str(args)
+        if tool_name == "task":
+            return (
+                args.get("subagent_type", "general"),
+                args.get("description", "") or str(args),
+            )
+        return (
+            args.get("agent_type", "general"),
+            args.get("task_description", "") or str(args),
+        )
 
     def _evt(icon: str, text: str, css: str = "", refresh: bool = True) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -418,10 +527,17 @@ def _stream_response(
             "type": agent_type,
             "status": "running",
             "elapsed": "",
-            "query": description[:60],
+            "query": description,
             "model": "",
             "started_at": time.time(),
         })
+        print(
+            "[CodingAgent Mermaid] spawn_subagent",
+            idx,
+            agent_type,
+            description[:120],
+            flush=True,
+        )
         return idx
 
     def _track_complete(
@@ -441,6 +557,32 @@ def _stream_response(
                     a["result_summary"] = result_summary
                 break
 
+    def _track_complete_by_index(
+        idx: int | None,
+        success: bool = True,
+        model: str = "",
+        result_summary: str = "",
+    ) -> bool:
+        if idx is None or idx < 0 or idx >= len(tracked_agents):
+            return False
+
+        agent = tracked_agents[idx]
+        agent["status"] = "completed" if success else "failed"
+        agent["elapsed"] = f"{time.time() - agent['started_at']:.1f}"
+        if model:
+            agent["model"] = model
+        if result_summary:
+            agent["result_summary"] = result_summary
+        print(
+            "[CodingAgent Mermaid] complete_subagent",
+            idx,
+            agent["type"],
+            agent["status"],
+            result_summary[:120],
+            flush=True,
+        )
+        return True
+
     def _agents_state() -> list[dict]:
         """Return locally tracked SubAgents for THIS query only.
 
@@ -455,6 +597,8 @@ def _stream_response(
             agents, working, prompt,
             result_text=result, model_name=model,
         )
+        if agents:
+            print("[CodingAgent Mermaid] source\n" + mdef, flush=True)
         _render_mermaid(graph_ph, mdef, events, working, num_agents=len(agents), tooltips=tips)
 
     # ── Non-streaming fallback ────────────────────────────
@@ -476,7 +620,7 @@ def _stream_response(
                     tools_used.append({
                         "name": tname,
                         "result": str(msg.content)[:200] if msg.content else "",
-                        "is_subagent": tname in ("spawn_subagent", "list_subagents"),
+                        "is_subagent": _is_subagent_tool(tname) or tname == "list_subagents",
                     })
                     _evt("🔧", f"Tool <b>{tname}</b> executed", "tool")
 
@@ -485,8 +629,9 @@ def _stream_response(
                 _cm = fallback_mw.current_model or "?"
                 if _cm:
                     _model_tag = f"<div class='agent-bubble-model'>🧠 {_escape_html(_cm)}</div>"
+                safe_final_text = _escape_bubble_html(final_text or "*(No response)*")
                 st.markdown(
-                    f"<div class='agent-bubble'>{final_text or '*(No response)*'}{_model_tag}</div>",
+                    f"<div class='agent-bubble'>{safe_final_text}{_model_tag}</div>",
                     unsafe_allow_html=True,
                 )
 
@@ -542,17 +687,19 @@ def _stream_response(
                         tool_calls = getattr(msg, "tool_calls", [])
                         if tool_calls:
                             for tc in tool_calls:
-                                name = tc.get("name", "unknown")
-                                args = tc.get("args", {})
-                                if name == "spawn_subagent":
-                                    atype = args.get("agent_type", "general")
-                                    full_desc = args.get("task_description", "")
+                                name = _tool_call_value(tc, "name", "unknown")
+                                args = _tool_call_value(tc, "args", {}) or {}
+                                if _is_subagent_tool(name):
+                                    atype, full_desc = _subagent_args(name, args)
                                     desc = _escape_html(full_desc[:60])
                                     # Track locally so Mermaid shows it immediately
-                                    _track_spawn(atype, full_desc)
+                                    tracked_idx = _track_spawn(atype, full_desc)
+                                    tool_call_id = _tool_call_value(tc, "id")
+                                    if tool_call_id:
+                                        tool_call_agents[str(tool_call_id)] = tracked_idx
                                     _evt(
                                         AGENT_ICONS.get(atype, "🤖"),
-                                        f"Spawning <b>{atype}</b> SubAgent: {desc}",
+                                        f"Spawning <b>{atype}</b> SubAgent via <b>{name}</b>: {desc}",
                                         "subagent",
                                     )
                                 elif name == "list_subagents":
@@ -578,8 +725,9 @@ def _stream_response(
                         if content and not tool_calls:
                             final_text = content
                             with result_ph:
+                                safe_final_text = _escape_bubble_html(final_text)
                                 st.markdown(
-                                    f"<div class='agent-bubble'>{final_text}</div>",
+                                    f"<div class='agent-bubble'>{safe_final_text}</div>",
                                     unsafe_allow_html=True,
                                 )
                             _evt(
@@ -590,25 +738,33 @@ def _stream_response(
 
                     elif msg_type == "tool":
                         tool_name = getattr(msg, "name", "unknown")
-                        tool_content = (
-                            str(msg.content)[:300] if msg.content else ""
-                        )
-                        is_sa = tool_name in ("spawn_subagent", "list_subagents")
+                        tool_call_id = getattr(msg, "tool_call_id", None)
+                        tracked_idx = tool_call_agents.get(str(tool_call_id)) if tool_call_id else None
+                        tool_content_full = str(msg.content) if msg.content else ""
+                        tool_content = tool_content_full[:300]
+                        is_sa = _is_subagent_tool(tool_name) or tool_name == "list_subagents"
                         tools_used.append({
                             "name": tool_name,
                             "result": tool_content,
                             "is_subagent": is_sa,
                         })
 
-                        if tool_name == "spawn_subagent":
+                        if _is_subagent_tool(tool_name):
                             # Extract info from registry history for model/elapsed
                             model_label = ""
-                            sa_type = ""
+                            if tracked_idx is None:
+                                tracked_idx = _track_spawn("general", f"{tool_name} result")
+                            sa_type = (
+                                tracked_agents[tracked_idx]["type"]
+                                if tracked_idx is not None and tracked_idx < len(tracked_agents)
+                                else ""
+                            )
                             sa_elapsed = ""
                             sa_model_short = ""
                             try:
                                 for t in reversed(sa_mw.registry.history):
-                                    sa_type = getattr(t, "agent_type", "")
+                                    if not sa_type:
+                                        sa_type = getattr(t, "agent_type", "")
                                     if hasattr(t, "model_used") and t.model_used:
                                         sa_model_short = t.model_used.split("/")[-1][:20]
                                         model_label = f" · 🧠 <b>{sa_model_short}</b>"
@@ -621,23 +777,26 @@ def _stream_response(
 
                             # Extract raw result from tool output (no truncation)
                             _result_raw = ""
-                            if "Result:" in tool_content:
-                                _ri = tool_content.index("Result:") + 7
-                                _result_raw = tool_content[_ri:].strip()
-                            elif tool_content.strip():
-                                _result_raw = tool_content.strip()
+                            if "Result:" in tool_content_full:
+                                _ri = tool_content_full.index("Result:") + 7
+                                _result_raw = tool_content_full[_ri:].strip()
+                            elif tool_content_full.strip():
+                                _result_raw = tool_content_full.strip()
 
-                            if "Result:" in tool_content or "result" in tool_content.lower()[:30]:
-                                _track_complete(sa_type or "general", success=True, model=sa_model_short, result_summary=_result_raw)
+                            if "Result:" in tool_content_full or "result" in tool_content_full.lower()[:30]:
+                                if not _track_complete_by_index(tracked_idx, success=True, model=sa_model_short, result_summary=_result_raw):
+                                    _track_complete(sa_type or "general", success=True, model=sa_model_short, result_summary=_result_raw)
                                 icon = AGENT_ICONS.get(sa_type, "✅")
                                 result_preview = _escape_html(tool_content[:80])
                                 _evt(icon, f"SubAgent <b>{sa_type}</b> completed{sa_elapsed}{model_label}: {result_preview}", "done")
-                            elif "failed" in tool_content.lower():
-                                _track_complete(sa_type or "general", success=False, model=sa_model_short, result_summary=_result_raw)
+                            elif "failed" in tool_content_full.lower():
+                                if not _track_complete_by_index(tracked_idx, success=False, model=sa_model_short, result_summary=_result_raw):
+                                    _track_complete(sa_type or "general", success=False, model=sa_model_short, result_summary=_result_raw)
                                 err_preview = _escape_html(tool_content[:80])
                                 _evt("❌", f"SubAgent failed: {err_preview}", "error")
                             else:
-                                _track_complete(sa_type or "general", success=True, model=sa_model_short, result_summary=_result_raw)
+                                if not _track_complete_by_index(tracked_idx, success=True, model=sa_model_short, result_summary=_result_raw):
+                                    _track_complete(sa_type or "general", success=True, model=sa_model_short, result_summary=_result_raw)
                                 _evt("🔄", f"SubAgent returned: {_escape_html(tool_content[:60])}", "subagent")
                             # SubAgent 상태 변경 → Mermaid 즉시 갱신
                             _refresh(True)
@@ -684,8 +843,9 @@ def _stream_response(
         current_model = fallback_mw.current_model or current_model or "unknown"
         _model_tag = f"<div class='agent-bubble-model'>🧠 {_escape_html(current_model)}</div>"
         with result_ph:
+            safe_final_text = _escape_bubble_html(final_text)
             st.markdown(
-                f"<div class='agent-bubble'>{final_text}{_model_tag}</div>",
+                f"<div class='agent-bubble'>{safe_final_text}{_model_tag}</div>",
                 unsafe_allow_html=True,
             )
         elapsed_s = f"{time.time() - t_start:.1f}"
@@ -888,16 +1048,17 @@ def render_chat() -> None:
                     model_html = ""
                     if msg.get("model"):
                         model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(msg['model'])}</div>"
+                    safe_content = _escape_bubble_html(msg["content"])
                     st.markdown(
                         f"<div class='agent-bubble-label'>🤖 Agent</div>"
-                        f"<div class='agent-bubble'>{msg['content']}{model_html}</div>",
+                        f"<div class='agent-bubble'>{safe_content}{model_html}</div>",
                         unsafe_allow_html=True,
                     )
 
                 with user_col:
                     st.markdown(
                         f"<div class='user-bubble-label'>👤 User</div>"
-                        f"<div class='user-bubble'>{_escape_html(_last_user_content)}</div>",
+                        f"<div class='user-bubble'>{_escape_bubble_html(_last_user_content)}</div>",
                         unsafe_allow_html=True,
                     )
 
@@ -925,7 +1086,7 @@ def render_chat() -> None:
                 prompt_display = pending or "(processing…)"
                 st.markdown(
                     f"<div class='user-bubble-label'>👤 User</div>"
-                    f"<div class='user-bubble'>{_escape_html(prompt_display)}</div>",
+                    f"<div class='user-bubble'>{_escape_bubble_html(prompt_display)}</div>",
                     unsafe_allow_html=True,
                 )
 

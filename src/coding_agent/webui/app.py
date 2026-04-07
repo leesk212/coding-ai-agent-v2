@@ -9,6 +9,16 @@ import traceback
 
 import streamlit as st
 
+from coding_agent.agent import SYSTEM_PROMPT
+
+WEBUI_SYSTEM_PROMPT = (
+    SYSTEM_PROMPT
+    + "\n\n## WebUI Flow Visualization\n"
+    + "- If both `task` and `spawn_subagent` are available for delegation, prefer "
+    + "`task(description, subagent_type)` because it is DeepAgents' native "
+    + "subagent tool and is visualized in the WebUI flow chart.\n"
+)
+
 st.set_page_config(
     page_title="Danny's Coding AI Agent",
     page_icon="data:,",
@@ -129,7 +139,7 @@ def _init_agent():
                         "model": settings.primary_model_string,
                         "assistant_id": "coding-ai-agent",
                         "tools": custom_tools,
-                        "system_prompt": "",
+                        "system_prompt": WEBUI_SYSTEM_PROMPT,
                         "interactive": False,
                         "auto_approve": True,
                         "enable_memory": True,
