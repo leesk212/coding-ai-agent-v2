@@ -13,7 +13,7 @@ st.set_page_config(
     page_title="Danny's Coding AI Agent",
     page_icon="data:,",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="collapsed",  # sidebar hidden via CSS
 )
 
 logging.getLogger("coding_agent").setLevel(logging.DEBUG)
@@ -25,10 +25,8 @@ st.markdown("""
     footer {visibility: hidden;}
     [data-testid="stStatusWidget"] {visibility: hidden;}
     [data-testid="stDecoration"] {display: none;}
-    /* Sidebar collapsed by default */
-    [data-testid="stSidebar"][aria-expanded="true"] {
-        min-width: 0px;
-    }
+    /* Sidebar completely hidden */
+    [data-testid="stSidebar"] {display:none !important;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -197,16 +195,32 @@ def main():
     if not st.session_state.initialized:
         st.stop()
 
-    # ── Sidebar: Settings 버튼만 좌측 하단 고정 ──────────────────────
-    with st.sidebar:
-        st.markdown(
-            "<div style='position:fixed; bottom:1.5rem; left:0; width:21rem; padding:0 1rem;'>",
-            unsafe_allow_html=True,
-        )
-        btn_type = "primary" if st.session_state.page == "settings" else "secondary"
-        if st.button("⚙️ Settings", use_container_width=True, type=btn_type, key="nav_settings"):
+    # ── Settings 버튼: 좌측 하단 고정 (사이드바 없이) ─────────────────
+    st.markdown(
+        """<style>
+        [data-testid="stSidebar"] {display:none !important;}
+        .settings-btn-wrap {
+            position:fixed; bottom:1.2rem; left:1.2rem; z-index:9999;
+        }
+        .settings-btn-wrap button {
+            background:#f8fafc; border:1px solid #cbd5e1; border-radius:8px;
+            padding:0.4rem 1rem; font-size:0.85rem; cursor:pointer;
+            color:#475569; transition:background 0.15s;
+        }
+        .settings-btn-wrap button:hover {background:#e2e8f0;}
+        </style>""",
+        unsafe_allow_html=True,
+    )
+    # Streamlit 네이티브 버튼을 fixed div로 감싸기
+    settings_col = st.container()
+    with settings_col:
+        st.markdown("<div class='settings-btn-wrap'>", unsafe_allow_html=True)
+        if st.button("⚙️ Settings", key="nav_settings"):
             if st.session_state.page != "settings":
                 st.session_state.page = "settings"
+                st.rerun()
+            else:
+                st.session_state.page = "chat"
                 st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
