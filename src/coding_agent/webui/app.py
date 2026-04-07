@@ -190,131 +190,6 @@ def _init_agent():
         st.rerun()
 
 
-def _render_home():
-    st.markdown(
-        "<h1 style='text-align:center; margin-top:40px'>Danny's Coding AI Agent</h1>"
-        "<p style='text-align:center; color:#64748b; font-size:1.1em'>"
-        "Agentic Loop &middot; Long-Term Memory &middot; Dynamic SubAgents &middot; Model Fallback</p>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    comp = st.session_state.agent_components
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Current Model", (comp["fallback_middleware"].current_model or "ready")[:25])
-    with col2:
-        st.metric("Memory Entries", st.session_state.mem_count)
-    with col3:
-        st.metric("SubAgent Tasks", len(comp["subagent_middleware"].registry.get_all_tasks()))
-    with col4:
-        st.metric("Models Available", len(comp["fallback_middleware"].models))
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    _, c2, _ = st.columns([1, 2, 1])
-    with c2:
-        st.markdown(
-            "<div style='text-align:center; padding:20px; "
-            "background:#f8fafc; border-radius:12px; border:1px solid #e2e8f0'>"
-            "<p style='font-size:1.2em'>Ready to start coding?</p></div>",
-            unsafe_allow_html=True,
-        )
-        # No st.rerun() — just set page, Streamlit handles via query_params
-        if st.button("💬 Start Chatting", use_container_width=True, type="primary"):
-            st.session_state.page = "chat"
-            st.rerun()  # Only rerun for explicit page navigation
-
-    st.markdown("---")
-    a1, a2, a3 = st.columns(3)
-    with a1:
-        st.markdown("**Model Fallback**\n\nOpenRouter models with circuit breaker auto-fallback.")
-    with a2:
-        st.markdown("**Long-Term Memory**\n\nChromaDB vector store with 4 knowledge categories.")
-    with a3:
-        st.markdown("**Dynamic SubAgents**\n\nSpecialized agents: code_writer, researcher, reviewer, debugger.")
-
-
-def _render_history():
-    """History page — session flow visualization with Mermaid FlowChart."""
-    st.markdown("### 📜 Chat History")
-
-    msgs = st.session_state.chat_messages
-    if not msgs:
-        st.info("No chat history yet. Start chatting first!")
-        return
-
-    if st.button("🗑️ Clear All History"):
-        st.session_state.chat_messages = []
-        st.rerun()
-
-    # Group into sessions (user + assistant pairs)
-    sessions = []
-    current_session = []
-    for msg in msgs:
-        current_session.append(msg)
-        if msg["role"] == "assistant":
-            sessions.append(current_session)
-            current_session = []
-    if current_session:
-        sessions.append(current_session)
-
-    # Import Mermaid renderer from chat page
-    from coding_agent.webui._pages.chat import _build_page_html
-
-    for si, session in enumerate(reversed(sessions)):
-        user_msg = next((m for m in session if m["role"] == "user"), None)
-        asst_msg = next((m for m in session if m["role"] == "assistant"), None)
-
-        prompt_preview = (user_msg["content"][:60] + "…") if user_msg and len(user_msg["content"]) > 60 else (user_msg["content"] if user_msg else "?")
-        st.markdown(f"#### Session {len(sessions) - si} — {prompt_preview}")
-
-        # ── FlowChart: Mermaid 스냅샷 (저장된 경우) ───────
-        if asst_msg and asst_msg.get("mermaid_def"):
-            mermaid_def = asst_msg["mermaid_def"]
-            mermaid_tips = asst_msg.get("mermaid_tooltips", {})
-            mermaid_evts = asst_msg.get("mermaid_events", [])
-            num_agents = asst_msg.get("num_agents", 0)
-
-            with st.expander("📊 FlowChart", expanded=False):
-                html = _build_page_html(mermaid_def, mermaid_evts, False, tooltips=mermaid_tips)
-                h = max(420, 260 + num_agents * 70)
-                st.iframe(html, height=h)
-
-        # ── User + Agent 결과 ─────────────────────────────
-        c1, c2 = st.columns([2, 3])
-
-        with c1:
-            st.markdown("**👤 User**")
-            st.info(user_msg["content"] if user_msg else "")
-
-        with c2:
-            st.markdown("**🤖 Agent**")
-            if asst_msg:
-                # 전체 결과 표시 (잘림 없음)
-                content = asst_msg["content"] or ""
-                if len(content) > 500:
-                    # 긴 결과: 접힌 형태로
-                    st.success(content[:500] + "…")
-                    with st.expander("📄 Full Response"):
-                        st.markdown(content)
-                else:
-                    st.success(content)
-                if asst_msg.get("model"):
-                    st.caption(f"🧠 {asst_msg['model']}")
-                tools = asst_msg.get("tools_used", [])
-                if tools:
-                    tool_names = ", ".join(t["name"] for t in tools)
-                    st.caption(f"🔧 Tools: {tool_names}")
-
-        # ── Activity Log (접힌 형태) ──────────────────────
-        if asst_msg and asst_msg.get("activity_log"):
-            with st.expander("📡 Event Feed", expanded=False):
-                for icon, text in asst_msg["activity_log"]:
-                    st.markdown(f"{icon} {text}", unsafe_allow_html=True)
-
-        st.markdown("---")
-
-
 def main():
     _init_state()
     _init_agent()
@@ -327,33 +202,33 @@ def main():
         st.markdown("### Danny's Coding AI Agent")
         st.markdown("---")
 
-        # Navigation buttons — only rerun on actual page change
-        for label, page_id in [("🏠 Home", "home"), ("💬 Chat", "chat"),
-                                ("📜 History", "history"), ("⚙️ Settings", "settings")]:
-            btn_type = "primary" if st.session_state.page == page_id else "secondary"
-            if st.button(label, use_container_width=True, type=btn_type, key=f"nav_{page_id}"):
-                if st.session_state.page != page_id:
-                    st.session_state.page = page_id
-                    st.rerun()  # Only rerun for page navigation
-
-        st.markdown("---")
         comp = st.session_state.agent_components
         st.success(f"Model: {comp['fallback_middleware'].current_model or 'ready'}")
         st.info(f"Memory: {st.session_state.mem_count} entries")
+        st.markdown("---")
 
-        with st.expander("🔒 Admin"):
-            if st.button("🔄 Reinitialize", use_container_width=True):
-                st.session_state.agent_components = None
-                st.session_state.initialized = False
+        # Chat 버튼
+        btn_type = "primary" if st.session_state.page == "chat" else "secondary"
+        if st.button("💬 Chat", use_container_width=True, type=btn_type, key="nav_chat"):
+            if st.session_state.page != "chat":
+                st.session_state.page = "chat"
                 st.rerun()
+
+        # Settings 버튼 — 하단 고정
+        st.markdown(
+            "<div style='position:fixed; bottom:1.5rem; width:inherit;'>",
+            unsafe_allow_html=True,
+        )
+        btn_type = "primary" if st.session_state.page == "settings" else "secondary"
+        if st.button("⚙️ Settings", use_container_width=True, type=btn_type, key="nav_settings"):
+            if st.session_state.page != "settings":
+                st.session_state.page = "settings"
+                st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
     # ── Page routing ─────────────────────────────────────────────────
     page = st.session_state.page
-    if page == "home":
-        _render_home()
-    elif page == "history":
-        _render_history()
-    elif page == "settings":
+    if page == "settings":
         from coding_agent.webui._pages.settings import render_settings
         render_settings()
     else:
