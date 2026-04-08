@@ -1,4 +1,4 @@
-"""Danny's Coding AI Agent — Single-page WebUI.
+"""Danny's Agent 동작 분석기 — Single-page WebUI.
 
 Run with: python -m coding_agent --webui
 """
@@ -20,7 +20,7 @@ WEBUI_SYSTEM_PROMPT = (
 )
 
 st.set_page_config(
-    page_title="Danny's Coding AI Agent",
+    page_title="Danny's Agent 동작 분석기",
     page_icon="data:,",
     layout="wide",
     initial_sidebar_state="collapsed",  # sidebar hidden via CSS
@@ -65,7 +65,7 @@ def _init_agent():
     init_area = st.empty()
     with init_area.container():
         st.markdown(
-            "<h2 style='text-align:center'>Danny's Coding AI Agent</h2>"
+            "<h2 style='text-align:center'>Danny's Agent 동작 분석기</h2>"
             "<p style='text-align:center; color:#888'>Loading...</p>",
             unsafe_allow_html=True,
         )
@@ -174,7 +174,7 @@ def _init_agent():
                 agent = create_react_agent(
                     model=primary_model,
                     tools=custom_tools,
-                    prompt="You are Danny's Coding AI Agent.",
+                    prompt="You are Danny's Agent 동작 분석기.",
                 )
                 log("✅", f"LangGraph agent created — {time.time()-t0:.1f}s", 95)
 

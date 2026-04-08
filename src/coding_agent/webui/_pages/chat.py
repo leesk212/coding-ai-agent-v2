@@ -1068,9 +1068,10 @@ def render_chat() -> None:
 
     Layout:
       ┌──────────────────────────────────────────────────────┐
-      │  (idle) Danny's Coding AI Agent  (중앙 타이틀)        │
-      │  (active) 👤 User bubble  │  🔍 Agent 동작 분석      │
-      │           💬 Result (full-width)                      │
+      │  (idle) Danny's Agent 동작 분석기  (중앙 타이틀)     │
+      │  (active) 🔍 Agent 동작 분석                          │
+      │           🤖 Agent answer                             │
+      │           👤 User prompt                              │
       ├──────────────────────────────────────────────────────┤
       │  📌 PROMPT 프리셋 버튼                                │
       │  📝 입력창  │ 🚀 Send / 🔄 Refresh                  │
@@ -1181,7 +1182,7 @@ def render_chat() -> None:
         st.markdown(
             "<div style='text-align:center;padding:100px 20px 60px'>"
             "<h1 style='color:#1e293b;font-size:2em;margin-bottom:8px'>"
-            "Danny's Coding AI Agent</h1>"
+            "Danny's Agent 동작 분석기</h1>"
             "<p style='color:#94a3b8;font-size:1.05em'>"
             "메시지를 입력하거나 프롬프트를 클릭하세요</p>"
             "</div>",
@@ -1197,12 +1198,12 @@ def render_chat() -> None:
         st.markdown(
             "<p style='text-align:center;color:#94a3b8;font-size:.85em;"
             "margin:0 0 12px;letter-spacing:.3px'>"
-            "Danny's Coding AI Agent</p>",
+            "Danny's Agent 동작 분석기</p>",
             unsafe_allow_html=True,
         )
 
         # Show previous conversation pairs (history within session)
-        # Layout: Agent answer above its user prompt → Mermaid analysis below.
+        # Layout: Mermaid analysis → Agent answer → User prompt.
         _last_user_content = ""
         _assistant_total = sum(
             1 for msg in st.session_state.chat_messages
@@ -1217,6 +1218,18 @@ def render_chat() -> None:
                 _assistant_idx += 1
                 _is_latest_assistant = _assistant_idx == _assistant_total
 
+                # ── Above: Agent 동작 분석 (full width) ───────
+                if msg.get("mermaid_def"):
+                    _hist_html = _build_page_html(
+                        msg["mermaid_def"],
+                        msg.get("mermaid_events", []),
+                        False,
+                        tooltips=msg.get("mermaid_tooltips", {}),
+                    )
+                    _h = max(350, 220 + msg.get("num_agents", 0) * 70)
+                    with st.expander("🔍 Agent 동작 분석", expanded=_is_latest_assistant):
+                        st.iframe(_hist_html, height=_h)
+
                 model_html = ""
                 if msg.get("model"):
                     model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(msg['model'])}</div>"
@@ -1228,18 +1241,6 @@ def render_chat() -> None:
                     f"<div class='user-bubble'>{_escape_bubble_html(_last_user_content)}</div>",
                     unsafe_allow_html=True,
                 )
-
-                # ── Below: Agent 동작 분석 (full width) ───────
-                if msg.get("mermaid_def"):
-                    _hist_html = _build_page_html(
-                        msg["mermaid_def"],
-                        msg.get("mermaid_events", []),
-                        False,
-                        tooltips=msg.get("mermaid_tooltips", {}),
-                    )
-                    _h = max(350, 220 + msg.get("num_agents", 0) * 70)
-                    with st.expander("🔍 Agent 동작 분석", expanded=_is_latest_assistant):
-                        st.iframe(_hist_html, height=_h)
 
                 st.markdown("<hr style='border:none;border-top:1px solid #e2e8f0;margin:12px 0'>",
                             unsafe_allow_html=True)
