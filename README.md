@@ -124,11 +124,28 @@ python -m unittest tests.test_code_review_workflow
 - `reviewer` -> `30242`
 - `debugger` -> `30243`
 
+`~/.deepagents/config.toml`의 `[async_subagents]`로 타입별 설정 오버라이드도 가능합니다.
+
+```toml
+[async_subagents.researcher]
+description = "Research specialist"
+graph_id = "researcher"
+system_prompt = "Research deeply and return structured findings."
+model = "openai:gpt-4o-mini"
+url = "http://127.0.0.1:30240"
+```
+
+- `url`이 있으면 host/port를 파싱해 해당 주소를 사용합니다.
+- 같은 이름(`researcher`, `code_writer` 등)은 기본 설정 위에 merge 됩니다.
+- 새 이름을 추가하면 새 async subagent 타입으로 등록됩니다.
+
 ## 메모리/모델 설정
 
 | Variable | Description | Default |
 |---|---|---|
 | `OPENROUTER_API_KEY` | OpenRouter API 키 | `""` |
+| `OPENAI_API_KEY` | OpenAI(ChatGPT) fallback API 키 | `""` |
+| `OPENAI_FALLBACK_MODEL` | OpenAI fallback 모델 | `gpt-4o-mini` |
 | `OLLAMA_BASE_URL` | Ollama URL | `http://localhost:11434` |
 | `LOCAL_FALLBACK_MODEL` | 로컬 fallback 모델 | `qwen2.5-coder:7b` |
 | `MEMORY_DIR` | ChromaDB 저장 경로 | `~/.coding_agent/memory` |
@@ -173,7 +190,9 @@ src/coding_agent/
 - 포트 충돌:
   - `ASYNC_SUBAGENT_BASE_PORT`를 다른 값으로 변경
 - OpenRouter 오류:
-  - API 키 확인 또는 Ollama fallback 준비
+  - `OPENROUTER_API_KEY` 확인
+  - OpenAI fallback을 쓰려면 `OPENAI_API_KEY` 설정
+  - 둘 다 실패하면 Ollama fallback 준비
 
 ## Reference
 

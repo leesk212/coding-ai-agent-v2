@@ -86,6 +86,7 @@ async def run_agent_loop(agent_components: dict) -> None:
     agent = agent_components["agent"]
     fallback_mw = agent_components["fallback_middleware"]
     loop_guard = agent_components["loop_guard"]
+    task_tracker = agent_components.get("async_task_tracker")
 
     config = {"configurable": {"thread_id": "cli-session"}}
 
@@ -143,9 +144,9 @@ async def run_agent_loop(agent_components: dict) -> None:
 
         try:
             inputs = {"messages": [HumanMessage(content=user_input)]}
+            response_text = ""
 
             with console.status("[bold cyan]Thinking...[/bold cyan]"):
-                response_text = ""
                 async for event in agent.astream_events(
                     inputs, config=config, version="v2"
                 ):
@@ -168,7 +169,44 @@ async def run_agent_loop(agent_components: dict) -> None:
                     elif kind == "on_tool_end":
                         console.print(" [dim green]done[/dim green]")
 
+                # Single-turn completion: wait/collect async subagent outputs
+                # before returning final answer to the user.
+                if task_tracker:
+                    max_rounds = 10
+                    for _ in range(max_rounds):
+                        tasks = task_tracker.get_tasks("cli-session")
+                        pending = [
+                            t
+                            for t in tasks
+                            if str(t.get("status", "")).lower() in {"pending", "running"}
+                        ]
+                        if not pending:
+                            break
+                        console.print(
+                            f"[dim cyan]> Collecting async tasks ({len(pending)} running)...[/dim cyan]"
+                        )
+                        followup = {
+                            "messages": [
+                                HumanMessage(
+                                    content=(
+                                        "Continue the same user request. "
+                                        "If async tasks are still running/pending, "
+                                        "call list_async_tasks/check_async_task first "
+                                        "and only provide final answer after completion."
+                                    )
+                                )
+                            ]
+                        }
+                        result = agent.invoke(followup, config=config)
+                        for msg in result.get("messages", []):
+                            if getattr(msg, "type", None) == "ai" and msg.content:
+                                text = msg.content if isinstance(msg.content, str) else str(msg.content)
+                                if text.strip():
+                                    response_text = text
+
                 console.print()
+                if response_text:
+                    console.print(response_text)
 
                 # Show model used
                 current_model = fallback_mw.current_model

@@ -9,9 +9,11 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -52,6 +54,87 @@ DEFAULT_ASYNC_SUBAGENTS: dict[str, dict[str, str]] = {
 }
 
 
+def load_async_subagents(config_path: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Load async subagent specs from `config.toml` if available.
+
+    Expected format:
+
+    ```toml
+    [async_subagents.researcher]
+    description = "Research specialist"
+    graph_id = "researcher"  # optional, defaults to table name
+    system_prompt = "..."
+    model = "openai:gpt-4o-mini"
+    url = "http://127.0.0.1:30240"  # optional host/port override
+    ```
+    """
+    if config_path is None:
+        config_path = Path.home() / ".deepagents" / "config.toml"
+    if not config_path.exists():
+        return {}
+
+    try:
+        with config_path.open("rb") as f:
+            data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError, PermissionError) as exc:
+        logger.warning("Could not load async subagents from %s: %s", config_path, exc)
+        return {}
+
+    section = data.get("async_subagents")
+    if not isinstance(section, dict):
+        return {}
+
+    loaded: dict[str, dict[str, Any]] = {}
+    for name, raw_spec in section.items():
+        if not isinstance(raw_spec, dict):
+            logger.warning("Skipping async subagent '%s': expected table", name)
+            continue
+        description = raw_spec.get("description")
+        if not isinstance(description, str) or not description.strip():
+            logger.warning(
+                "Skipping async subagent '%s': missing non-empty description", name
+            )
+            continue
+
+        graph_id = raw_spec.get("graph_id")
+        if graph_id is not None and not isinstance(graph_id, str):
+            logger.warning("Ignoring invalid graph_id for async subagent '%s'", name)
+            graph_id = None
+
+        spec: dict[str, Any] = {
+            "description": description.strip(),
+            "system_prompt": (
+                raw_spec["system_prompt"].strip()
+                if isinstance(raw_spec.get("system_prompt"), str)
+                and raw_spec["system_prompt"].strip()
+                else (
+                    f"You are the '{name}' specialist. Complete the delegated task "
+                    "accurately and return concise, actionable results."
+                )
+            ),
+            "graph_id": (graph_id or name).strip(),
+        }
+
+        model = raw_spec.get("model")
+        if isinstance(model, str) and model.strip():
+            spec["model"] = model.strip()
+
+        url = raw_spec.get("url")
+        if isinstance(url, str) and url.strip():
+            parsed = urlparse(url.strip())
+            if parsed.scheme in {"http", "https"} and parsed.hostname and parsed.port:
+                spec["host"] = parsed.hostname
+                spec["port"] = parsed.port
+            else:
+                logger.warning(
+                    "Ignoring invalid url for async subagent '%s': %s", name, url
+                )
+
+        loaded[name] = spec
+
+    return loaded
+
+
 @dataclass
 class LocalAsyncSubagentProcess:
     name: str
@@ -65,10 +148,11 @@ class LocalAsyncSubagentProcess:
     external: bool = False
     started_at: float | None = None
     last_error: str | None = None
-    graph_id: str = field(init=False)
+    graph_id: str = ""
 
     def __post_init__(self) -> None:
-        self.graph_id = self.name
+        if not self.graph_id:
+            self.graph_id = self.name
 
     @property
     def url(self) -> str:
@@ -100,11 +184,28 @@ class LocalAsyncSubagentManager:
         cfg: Settings | None = None,
         *,
         root_dir: Path | None = None,
-        subagents: dict[str, dict[str, str]] | None = None,
+        subagents: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.cfg = cfg or settings
         self.root_dir = (root_dir or Path.cwd()).resolve()
-        self._subagents = subagents or DEFAULT_ASYNC_SUBAGENTS
+        if subagents is None:
+            loaded = load_async_subagents()
+            if loaded:
+                merged: dict[str, dict[str, Any]] = {
+                    name: dict(spec) for name, spec in DEFAULT_ASYNC_SUBAGENTS.items()
+                }
+                for name, spec in loaded.items():
+                    if name in merged:
+                        merged[name] = {**merged[name], **spec}
+                    else:
+                        merged[name] = spec
+                self._subagents = merged
+            else:
+                self._subagents = {
+                    name: dict(spec) for name, spec in DEFAULT_ASYNC_SUBAGENTS.items()
+                }
+        else:
+            self._subagents = subagents
         self._processes: dict[str, LocalAsyncSubagentProcess] = {}
         self._shutdown_registered = False
 
@@ -128,10 +229,11 @@ class LocalAsyncSubagentManager:
                 name=name,
                 description=meta["description"],
                 system_prompt=meta["system_prompt"],
-                host=self.cfg.async_subagent_host,
-                port=self.cfg.async_subagent_base_port + idx,
+                host=str(meta.get("host", self.cfg.async_subagent_host)),
+                port=int(meta.get("port", self.cfg.async_subagent_base_port + idx)),
                 root_dir=self.root_dir,
-                model=self.cfg.primary_model_string,
+                model=str(meta.get("model", self.cfg.primary_model_string)),
+                graph_id=str(meta.get("graph_id", name)),
             )
         return self._processes[name]
 

@@ -15,6 +15,7 @@ import logging
 from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware
+from langchain_core.messages import SystemMessage
 from langchain_core.tools import tool
 
 from coding_agent.memory.categories import MemoryCategory
@@ -113,8 +114,22 @@ class LongTermMemoryMiddleware(AgentMiddleware):
 
         # Try to inject into system prompt
         try:
-            current_system = getattr(request, "system_message", "") or ""
-            new_system = current_system + "\n\n" + memory_text
+            current_system = getattr(request, "system_message", None)
+            if isinstance(current_system, SystemMessage):
+                existing_blocks = list(current_system.content_blocks)
+                text = f"\n\n{memory_text}" if existing_blocks else memory_text
+                new_system = SystemMessage(
+                    content_blocks=[*existing_blocks, {"type": "text", "text": text}]
+                )
+            else:
+                current_text = str(current_system or "").strip()
+                if current_text:
+                    combined = f"{current_text}\n\n{memory_text}"
+                else:
+                    combined = memory_text
+                new_system = SystemMessage(
+                    content_blocks=[{"type": "text", "text": combined}]
+                )
             modified_request = request.override(system_message=new_system)
             return handler(modified_request)
         except (AttributeError, TypeError):
@@ -133,8 +148,22 @@ class LongTermMemoryMiddleware(AgentMiddleware):
         memory_text = self.get_relevant_context(query)
 
         try:
-            current_system = getattr(request, "system_message", "") or ""
-            new_system = current_system + "\n\n" + memory_text
+            current_system = getattr(request, "system_message", None)
+            if isinstance(current_system, SystemMessage):
+                existing_blocks = list(current_system.content_blocks)
+                text = f"\n\n{memory_text}" if existing_blocks else memory_text
+                new_system = SystemMessage(
+                    content_blocks=[*existing_blocks, {"type": "text", "text": text}]
+                )
+            else:
+                current_text = str(current_system or "").strip()
+                if current_text:
+                    combined = f"{current_text}\n\n{memory_text}"
+                else:
+                    combined = memory_text
+                new_system = SystemMessage(
+                    content_blocks=[{"type": "text", "text": combined}]
+                )
             modified_request = request.override(system_message=new_system)
             return await handler(modified_request)
         except (AttributeError, TypeError):

@@ -23,6 +23,17 @@ def render_settings() -> None:
         os.environ["OPENROUTER_API_KEY"] = openrouter_key
         st.success("OpenRouter API key updated!")
 
+    openai_key = st.text_input(
+        "OpenAI API Key (ChatGPT fallback)",
+        value=settings.openai_api_key or "",
+        type="password",
+        help="Used when OpenRouter models fail or are unavailable.",
+    )
+    if openai_key != settings.openai_api_key:
+        settings.openai_api_key = openai_key
+        os.environ["OPENAI_API_KEY"] = openai_key
+        st.success("OpenAI API key updated!")
+
     st.markdown("---")
 
     # Model Configuration
@@ -38,6 +49,18 @@ def render_settings() -> None:
         col2.text(model.provider)
 
     st.markdown(f"**Fallback:** {settings.local_fallback_model.name} (Ollama local)")
+
+    openai_model = st.text_input(
+        "OpenAI Fallback Model",
+        value=settings.openai_fallback_model.name,
+        help="Used as cloud fallback before local Ollama (e.g., gpt-4o-mini, gpt-4.1-mini).",
+    )
+    if openai_model != settings.openai_fallback_model.name:
+        settings.openai_fallback_model = ModelSpec(
+            name=openai_model,
+            provider="openai",
+            priority=90,
+        )
 
     st.markdown("---")
 

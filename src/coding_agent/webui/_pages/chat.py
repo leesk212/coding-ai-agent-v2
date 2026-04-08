@@ -18,10 +18,14 @@ Layout (top → bottom):
 
 import json
 import logging
+import queue
 import re
+import threading
 import time
 import traceback
+import uuid
 
+import httpx
 import streamlit as st
 from langchain_core.messages import HumanMessage
 
@@ -137,6 +141,44 @@ def _escape_bubble_html(text: str) -> str:
     )
 
 
+def _user_bubble_style(text: str) -> str:
+    """Return a width style tuned to user prompt length."""
+    raw = text or ""
+    lines = raw.count("\n") + 1
+    length = len(raw)
+    score = max(length, lines * 22)
+    if score <= 24:
+        width = 34
+    elif score <= 80:
+        width = 48
+    elif score <= 180:
+        width = 64
+    elif score <= 360:
+        width = 78
+    else:
+        width = 92
+    return f"max-width:{width}%;"
+
+
+def _agent_bubble_style(text: str) -> str:
+    """Return a width style tuned to agent response length."""
+    raw = text or ""
+    lines = raw.count("\n") + 1
+    length = len(raw)
+    score = max(length, lines * 20)
+    if score <= 36:
+        width = 40
+    elif score <= 120:
+        width = 56
+    elif score <= 260:
+        width = 70
+    elif score <= 520:
+        width = 82
+    else:
+        width = 92
+    return f"max-width:{width}%;"
+
+
 def _edge_label(text: str, fallback: str, limit: int = 28) -> str:
     """Return a short Mermaid-safe edge label."""
     safe_text = _clean_label_text(text or "")
@@ -208,6 +250,10 @@ def _build_mermaid(
             detail += f" {a['task_id'][:8]}"
         if a.get("elapsed"):
             detail += f" {a['elapsed']}s"
+        if a.get("port"):
+            detail += f"<br/>127.0.0.1:{a['port']}"
+        if a.get("pid"):
+            detail += f"<br/>pid {a['pid']}"
 
         nid = f"S{i}"
         label = f"{_esc(a['type'])} Agent<br/><small>{detail}</small>"
@@ -294,6 +340,14 @@ def _build_mermaid(
             task_meta = f"task_id: {a['task_id']}"
             if a.get("run_id"):
                 task_meta += f"\nrun_id: {a['run_id']}"
+            if a.get("url"):
+                task_meta += f"\nurl: {a['url']}"
+            if a.get("port"):
+                task_meta += f"\naddress: 127.0.0.1:{a['port']}"
+            if a.get("ip"):
+                task_meta += f"\nip: {a['ip']}"
+            if a.get("pid"):
+                task_meta += f"\npid: {a['pid']}"
             _add_tooltip(tooltips, _edge_label(a.get("query", ""), f"{a['type']} task"), (a.get("query", "") + "\n\n" + task_meta).strip())
 
     return "\n".join(lines), tooltips
@@ -579,6 +633,8 @@ def _stream_response(
     prompt: str,
     graph_ph,
     result_ph,
+    subagent_ph=None,
+    query_session_id: str | None = None,
 ) -> bool:
     """Stream agent response — update flowchart, event feed, and result."""
     comp = st.session_state.agent_components
@@ -589,16 +645,15 @@ def _stream_response(
     fallback_mw = comp["fallback_middleware"]
     loop_guard = comp["loop_guard"]
 
-    st.session_state.chat_messages.append({"role": "user", "content": prompt})
+    session_id = query_session_id or f"q-{uuid.uuid4().hex}"
+    st.session_state.chat_messages.append(
+        {"role": "user", "content": prompt, "session_id": session_id}
+    )
     loop_guard.reset()
 
-    # ── Stable per-conversation thread ID ────────────────────
-    thread_id = st.session_state.get("_conversation_thread_id")
-    if not thread_id:
-        import uuid as _uuid
-
-        thread_id = f"webui-{_uuid.uuid4().hex}"
-        st.session_state["_conversation_thread_id"] = thread_id
+    # One user query = one isolated execution session/thread.
+    # This prevents Mermaid/task state from leaking across turns.
+    thread_id = session_id
     config = {"configurable": {"thread_id": thread_id}}
     inputs = {"messages": [HumanMessage(content=prompt)]}
 
@@ -616,6 +671,29 @@ def _stream_response(
     _sa_counter = [0]  # mutable counter for unique IDs
     tool_call_agents: dict[str, int] = {}
     tool_call_actions: dict[str, str] = {}
+    _subagent_stream_log_at: dict[int, float] = {}
+    sse_queue: queue.Queue[tuple[str, int | None, str]] = queue.Queue()
+    sse_stop = threading.Event()
+    sse_threads: list[threading.Thread] = []
+
+    manager = comp.get("subagent_manager")
+    agent_url_by_type: dict[str, str] = {}
+    agent_runtime_by_type: dict[str, dict[str, str | int | None]] = {}
+    if manager:
+        try:
+            for row in manager.get_all_tasks():
+                atype = str(row.get("agent_type", "")).strip()
+                url = str(row.get("url", "")).strip()
+                if atype and url:
+                    agent_url_by_type[atype] = url
+                    agent_runtime_by_type[atype] = {
+                        "url": url,
+                        "ip": str(url).split("://", 1)[-1].rsplit(":", 1)[0],
+                        "pid": row.get("pid"),
+                        "port": int(str(url).rsplit(":", 1)[-1]) if ":" in str(url) else None,
+                    }
+        except Exception:
+            pass
 
     # ── helpers ───────────────────────────────────────────
 
@@ -635,6 +713,15 @@ def _stream_response(
         except Exception:
             return []
 
+    def _pending_async_tasks() -> list[dict]:
+        rows = _capture_async_tasks()
+        pending: list[dict] = []
+        for row in rows:
+            status = str(row.get("status", "")).lower()
+            if status in {"pending", "running"}:
+                pending.append(row)
+        return pending
+
     def _persist_history_snapshot(content: str, model: str, events_working: bool = False) -> None:
         nonlocal history_snapshot_saved
         if history_snapshot_saved:
@@ -651,6 +738,8 @@ def _stream_response(
             "role": "assistant",
             "content": content,
             "model": model,
+            "session_id": session_id,
+            "thread_id": thread_id,
             "tools_used": list(tools_used),
             "activity_log": [(e["icon"], e["text"]) for e in events],
             "mermaid_def": final_mdef,
@@ -658,28 +747,103 @@ def _stream_response(
             "mermaid_events": list(events),
             "num_agents": len(final_agents),
             "async_task_snapshot": _capture_async_tasks(),
+            "subagent_streams": _collect_subagent_stream_rows(),
         })
         history_snapshot_saved = True
+
+    def _collect_subagent_stream_rows() -> list[dict]:
+        rows: list[dict] = []
+        for row in tracked_agents:
+            stream_text = str(row.get("result_summary", "")).strip()
+            rows.append(
+                {
+                    "id": row.get("id", ""),
+                    "type": row.get("type", "subagent"),
+                    "status": row.get("status", "running"),
+                    "task_id": row.get("task_id", ""),
+                    "ip": row.get("ip"),
+                    "port": row.get("port"),
+                    "pid": row.get("pid"),
+                    "url": row.get("url", ""),
+                    "text": stream_text[-1400:],
+                }
+            )
+        return rows
+
+    def _render_subagent_streams() -> None:
+        if subagent_ph is None:
+            return
+        rows = _collect_subagent_stream_rows()
+        if not rows:
+            subagent_ph.empty()
+            return
+        parts = [
+            "<div style='margin-top:8px;padding:10px 12px;border:1px solid #bbf7d0;"
+            "border-radius:12px;background:#f0fdf4'>",
+            "<div style='font-size:.78em;font-weight:700;color:#166534;margin-bottom:6px'>"
+            "📡 SubAgent Streaming Output</div>",
+        ]
+        for row in rows[-6:]:
+            icon = AGENT_ICONS.get(str(row["type"]), "🤖")
+            safe_text = _escape_bubble_html(str(row["text"])) if str(row["text"]).strip() else "<i style='color:#64748b'>waiting for stream...</i>"
+            tid = str(row.get("task_id", "") or "")
+            tid_badge = f"<span style='color:#94a3b8;font-size:.9em'> · { _escape_html(tid[:10]) }...</span>" if tid else ""
+            runtime_lines = []
+            if row.get("port"):
+                runtime_lines.append(f"127.0.0.1:{_escape_html(str(row['port']))}")
+            if row.get("pid"):
+                runtime_lines.append(f"pid {_escape_html(str(row['pid']))}")
+            runtime_block = (
+                "<div style='color:#94a3b8;font-size:.88em;margin:2px 0 4px'>"
+                + "<br>".join(runtime_lines)
+                + "</div>"
+                if runtime_lines else ""
+            )
+            status_color = {
+                "running": "#166534",
+                "completed": "#1d4ed8",
+                "failed": "#b91c1c",
+                "cancelled": "#9a3412",
+                "pending": "#92400e",
+            }.get(str(row["status"]).lower(), "#334155")
+            parts.append(
+                "<div style='padding:7px 8px;margin-bottom:6px;border:1px solid #dcfce7;"
+                "border-radius:8px;background:#ffffff;color:#166534;font-size:.86em;line-height:1.45'>"
+                f"<b>{icon} {_escape_html(str(row['type']))}</b>{tid_badge} "
+                f"<span style='color:{status_color}'>[{_escape_html(str(row['status']))}]</span><br>"
+                f"{runtime_block}"
+                f"{safe_text}"
+                "</div>"
+            )
+        parts.append("</div>")
+        subagent_ph.markdown("".join(parts), unsafe_allow_html=True)
 
     def _render_agent_status(text: str) -> None:
         """Show progress in the Agent bubble until actual model content arrives."""
         if final_text:
             return
+        style = _agent_bubble_style(text)
         result_ph.markdown(
-            "<div class='agent-bubble'>"
-            f"{text}<div class='agent-bubble-model'>Working...</div>"
-            "</div>",
+            "<div class='agent-bubble-wrap'>"
+            f"<div class='agent-bubble' style='{style}'>"
+            f"{text}<div class='agent-bubble-model'>Working...</div></div></div>"
+            ,
             unsafe_allow_html=True,
         )
+        _render_subagent_streams()
 
     def _render_agent_answer(text: str, model: str = "") -> None:
         model_html = ""
         if model:
             model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(model)}</div>"
+        style = _agent_bubble_style(text)
         result_ph.markdown(
-            f"<div class='agent-bubble'>{_escape_bubble_html(text)}{model_html}</div>",
+            "<div class='agent-bubble-wrap'>"
+            f"<div class='agent-bubble' style='{style}'>{_escape_bubble_html(text)}{model_html}</div>"
+            "</div>",
             unsafe_allow_html=True,
         )
+        _render_subagent_streams()
 
     def _message_text_delta(message, metadata) -> str:
         """Extract user-visible streamed text from a LangGraph messages chunk."""
@@ -742,6 +906,7 @@ def _stream_response(
         """Record a SubAgent spawn locally. Returns the index."""
         idx = _sa_counter[0]
         _sa_counter[0] += 1
+        runtime_meta = agent_runtime_by_type.get(agent_type, {})
         tracked_agents.append({
             "id": f"local_{idx}",
             "type": agent_type,
@@ -752,6 +917,10 @@ def _stream_response(
             "task_id": "",
             "run_id": "",
             "model": "",
+            "url": runtime_meta.get("url", ""),
+            "ip": runtime_meta.get("ip", ""),
+            "port": runtime_meta.get("port"),
+            "pid": runtime_meta.get("pid"),
             "started_at": time.time(),
         })
         print(
@@ -831,7 +1000,30 @@ def _stream_response(
         return True
 
     def _parse_task_id(text: str) -> str:
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                tid = str(data.get("task_id") or data.get("thread_id") or "").strip()
+                if tid:
+                    return tid
+        except Exception:
+            pass
         match = re.search(r"task_id:\s*([a-f0-9-]{8,})", text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+        match = re.search(r"thread_id:\s*([a-f0-9-]{8,})", text, flags=re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    def _parse_run_id(text: str) -> str:
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                rid = str(data.get("run_id") or "").strip()
+                if rid:
+                    return rid
+        except Exception:
+            pass
+        match = re.search(r"run_id:\s*([a-f0-9-]{8,})", text, flags=re.IGNORECASE)
         return match.group(1) if match else ""
 
     def _parse_check_payload(text: str) -> dict[str, str]:
@@ -872,6 +1064,94 @@ def _stream_response(
                 else:
                     tracked_agents[idx]["status"] = "running"
 
+    def _start_subagent_sse_listener(
+        task_id: str,
+        run_id: str,
+        agent_type: str,
+        tracked_idx: int | None,
+    ) -> None:
+        if not task_id or not run_id:
+            return
+        base_url = agent_url_by_type.get(agent_type)
+        if not base_url:
+            _evt("⚠️", f"SSE unavailable: unknown subagent url for {agent_type}", "error")
+            return
+        stream_url = f"{base_url}/threads/{task_id}/runs/{run_id}/stream"
+        _evt("📡", f"SubAgent SSE connected: {agent_type} ({task_id[:8]}...)", "subagent")
+
+        def _worker() -> None:
+            try:
+                with httpx.Client(timeout=None) as client:
+                    with client.stream("GET", stream_url) as resp:
+                        if resp.status_code != 200:
+                            sse_queue.put(("error", tracked_idx, f"SSE status {resp.status_code}"))
+                            return
+                        event_type = "message"
+                        data_parts: list[str] = []
+                        for raw in resp.iter_lines():
+                            if sse_stop.is_set():
+                                break
+                            line = (raw or "").strip()
+                            if not line:
+                                if not data_parts:
+                                    continue
+                                payload_raw = "".join(data_parts)
+                                data_parts = []
+                                try:
+                                    payload = json.loads(payload_raw)
+                                except json.JSONDecodeError:
+                                    payload = {"text": payload_raw}
+                                if event_type == "token":
+                                    sse_queue.put(("token", tracked_idx, str(payload.get("text", ""))))
+                                elif event_type in {"final", "error", "status"}:
+                                    sse_queue.put(("state", tracked_idx, json.dumps(payload)))
+                                event_type = "message"
+                                continue
+                            if line.startswith("event:"):
+                                event_type = line.split(":", 1)[1].strip()
+                            elif line.startswith("data:"):
+                                data_parts.append(line.split(":", 1)[1].strip())
+            except Exception as exc:
+                sse_queue.put(("error", tracked_idx, str(exc)))
+
+        th = threading.Thread(target=_worker, daemon=True)
+        th.start()
+        sse_threads.append(th)
+
+    def _drain_sse_queue() -> bool:
+        updated = False
+        while True:
+            try:
+                kind, idx, payload = sse_queue.get_nowait()
+            except queue.Empty:
+                break
+            updated = True
+            if kind == "token":
+                _append_subagent_stream(idx, payload)
+                if idx is not None and 0 <= idx < len(tracked_agents):
+                    tracked_agents[idx]["last_action"] = "streaming"
+            elif kind == "state":
+                data = {}
+                try:
+                    data = json.loads(payload)
+                except Exception:
+                    data = {}
+                status = str(data.get("status", "")).lower()
+                if status == "success":
+                    _track_complete_by_index(idx, success=True, status="completed")
+                elif status == "cancelled":
+                    _track_complete_by_index(idx, success=False, status="cancelled")
+                elif status == "error":
+                    _track_complete_by_index(
+                        idx,
+                        success=False,
+                        status="failed",
+                        result_summary=str(data.get("error", "error")),
+                    )
+            elif kind == "error":
+                _evt("❌", f"SSE listener error: {_escape_html(payload[:120])}", "error")
+        return updated
+
     def _agents_state() -> list[dict]:
         """Return locally tracked SubAgents for THIS query only.
 
@@ -888,6 +1168,139 @@ def _stream_response(
         if agents:
             print("[CodingAgent Mermaid] source\n" + mdef, flush=True)
         _render_mermaid(graph_ph, mdef, events, working, num_agents=len(agents), tooltips=tips)
+        _render_subagent_streams()
+
+    def _namespace_text(namespace) -> str:
+        if isinstance(namespace, (list, tuple)):
+            return " ".join(str(x) for x in namespace)
+        return str(namespace or "")
+
+    def _subagent_idx_from_namespace(namespace) -> int | None:
+        ns = _namespace_text(namespace).lower()
+        if not ns:
+            return None
+        # Prefer currently running tracked agent whose type appears in namespace.
+        for idx in range(len(tracked_agents) - 1, -1, -1):
+            row = tracked_agents[idx]
+            if row.get("status") != "running":
+                continue
+            atype = str(row.get("type", "")).lower()
+            if atype and atype in ns:
+                return idx
+        # Fallback to most recent running subagent.
+        for idx in range(len(tracked_agents) - 1, -1, -1):
+            if tracked_agents[idx].get("status") == "running":
+                return idx
+        return None
+
+    def _append_subagent_stream(idx: int | None, text_delta: str) -> None:
+        if idx is None or idx < 0 or idx >= len(tracked_agents):
+            return
+        if not text_delta.strip():
+            return
+        row = tracked_agents[idx]
+        prev = str(row.get("result_summary", ""))
+        row["result_summary"] = (prev + text_delta)[-5000:]
+        row["last_action"] = "streaming"
+
+    def _auto_collect_async_until_done() -> None:
+        nonlocal final_text, streamed_text, current_model
+        max_rounds = 10
+        max_wait_s = 120.0
+        round_idx = 0
+        collect_prompt = (
+            "Continue the same user request. "
+            "If any async tasks are still running or pending, do not give final answer yet. "
+            "First call list_async_tasks, then check_async_task for active task IDs, "
+            "and only after all relevant tasks are completed/cancelled/errored, "
+            "synthesize the final answer."
+        )
+
+        while True:
+            if _is_refresh_requested() or _is_stop_requested():
+                return
+            if _drain_sse_queue():
+                _refresh(True)
+
+            pending = _pending_async_tasks()
+            if not pending:
+                return
+
+            if round_idx >= max_rounds or (time.time() - t_start) > max_wait_s:
+                _evt(
+                    "⚠️",
+                    "Async tasks are still running after wait window. Returning latest aggregate.",
+                    "error",
+                )
+                return
+
+            round_idx += 1
+            preview = ", ".join(str(t.get("task_id", ""))[:8] for t in pending[:3])
+            _evt(
+                "⏳",
+                f"Collecting async results ({len(pending)} running): {preview}",
+                "subagent",
+            )
+
+            followup_inputs = {"messages": [HumanMessage(content=collect_prompt)]}
+            result = agent.invoke(followup_inputs, config=config)
+            for msg in result.get("messages", []):
+                msg_type = getattr(msg, "type", None)
+                if msg_type == "ai" and msg.content:
+                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    if content.strip():
+                        final_text = content
+                        streamed_text = content
+                        current_model = fallback_mw.current_model or current_model or "unknown"
+                        _render_agent_answer(final_text, current_model)
+                elif msg_type == "tool":
+                    tool_name = getattr(msg, "name", "unknown")
+                    tool_content_full = str(msg.content) if msg.content else ""
+                    if tool_name == "list_async_tasks":
+                        _apply_list_async_tasks(tool_content_full)
+                    elif tool_name == "check_async_task":
+                        payload = _parse_check_payload(tool_content_full)
+                        idx = _find_tracked_by_task_id(payload.get("thread_id", ""))
+                        status = payload.get("status", "").lower()
+                        if status == "success":
+                            _track_complete_by_index(
+                                idx,
+                                success=True,
+                                result_summary=payload.get("result", ""),
+                                status="completed",
+                            )
+                        elif status == "cancelled":
+                            _track_complete_by_index(
+                                idx,
+                                success=False,
+                                result_summary=payload.get("error", "cancelled"),
+                                status="cancelled",
+                            )
+                        elif status == "error":
+                            _track_complete_by_index(
+                                idx,
+                                success=False,
+                                result_summary=payload.get("error", "error"),
+                                status="failed",
+                            )
+                        else:
+                            _set_task_action(idx, "check")
+                    tools_used.append(
+                        {
+                            "name": tool_name,
+                            "result": tool_content_full[:300],
+                            "is_subagent": _is_subagent_tool(tool_name),
+                        }
+                    )
+
+            _refresh(True)
+            if _pending_async_tasks():
+                for _ in range(4):
+                    if _is_refresh_requested() or _is_stop_requested():
+                        return
+                    if _drain_sse_queue():
+                        _refresh(True)
+                    time.sleep(0.2)
 
     # ── Non-streaming fallback ────────────────────────────
 
@@ -911,6 +1324,8 @@ def _stream_response(
                         "is_subagent": _is_subagent_tool(tname),
                     })
                     _evt("🔧", f"Tool <b>{tname}</b> executed", "tool")
+
+            _auto_collect_async_until_done()
 
             with result_ph:
                 _model_tag = ""
@@ -938,6 +1353,8 @@ def _stream_response(
                 "role": "assistant",
                 "content": final_text or "*(No response)*",
                 "model": current_model,
+                "session_id": session_id,
+                "thread_id": thread_id,
                 "tools_used": tools_used,
                 "activity_log": [(e["icon"], e["text"]) for e in events],
                 "mermaid_def": inv_mdef,
@@ -968,6 +1385,8 @@ def _stream_response(
             )
 
         for raw_chunk in stream:
+            if _drain_sse_queue():
+                _refresh(True)
             if _is_refresh_requested():
                 _evt("🛑", "Refresh requested — stopping current run", "error", refresh=False)
                 return False
@@ -996,8 +1415,6 @@ def _stream_response(
                 is_main_agent = True
 
             if current_stream_mode == "messages":
-                if not is_main_agent:
-                    continue
                 if not isinstance(chunk_data, tuple) or len(chunk_data) != 2:
                     continue
                 message, metadata = chunk_data
@@ -1005,9 +1422,27 @@ def _stream_response(
                 if msg_type == "AIMessageChunk" or "AIMessageChunk" in type(message).__name__ or msg_type == "ai":
                     text_delta = _message_text_delta(message, metadata)
                     if text_delta:
-                        streamed_text += text_delta
-                        final_text = streamed_text
-                        _render_agent_answer(streamed_text)
+                        if is_main_agent:
+                            streamed_text += text_delta
+                            final_text = streamed_text
+                            _render_agent_answer(streamed_text)
+                        else:
+                            sa_idx = _subagent_idx_from_namespace(namespace)
+                            _append_subagent_stream(sa_idx, text_delta)
+                            if sa_idx is not None:
+                                sa_type = tracked_agents[sa_idx].get("type", "subagent")
+                                now = time.time()
+                                last = _subagent_stream_log_at.get(sa_idx, 0.0)
+                                if now - last > 0.8:
+                                    preview = _escape_html(text_delta.strip()[:80])
+                                    if preview:
+                                        _evt(
+                                            AGENT_ICONS.get(str(sa_type), "🤖"),
+                                            f"{sa_type} streaming: {preview}",
+                                            "subagent",
+                                        )
+                                        _subagent_stream_log_at[sa_idx] = now
+                                _refresh(True)
                 continue
 
             if not is_main_agent:
@@ -1131,10 +1566,8 @@ def _stream_response(
                                 "done",
                                 refresh=False,
                             )
-                            _refresh(False, result=final_text, model=current_model)
+                            _refresh(True, result=final_text, model=current_model)
                             _render_agent_answer(final_text, current_model)
-                            _persist_history_snapshot(final_text, current_model)
-                            return True
 
                     elif msg_type == "tool":
                         tool_name = getattr(msg, "name", "unknown")
@@ -1163,8 +1596,9 @@ def _stream_response(
                             # Extract raw result from tool output (no truncation)
                             _result_raw = ""
                             task_id = _parse_task_id(tool_content_full)
+                            run_id = _parse_run_id(tool_content_full)
                             if task_id:
-                                _set_task_identity(tracked_idx, task_id=task_id)
+                                _set_task_identity(tracked_idx, task_id=task_id, run_id=run_id)
                             if tool_content_full.strip():
                                 _result_raw = tool_content_full.strip()
 
@@ -1175,6 +1609,8 @@ def _stream_response(
                                     "subagent",
                                 )
                                 _set_task_action(tracked_idx, "launch")
+                                if run_id:
+                                    _start_subagent_sse_listener(task_id, run_id, sa_type, tracked_idx)
                             elif "failed" in tool_content_full.lower():
                                 if not _track_complete_by_index(
                                     tracked_idx,
@@ -1260,6 +1696,8 @@ def _stream_response(
                 if fallback_mw.current_model:
                     current_model = fallback_mw.current_model
 
+        _auto_collect_async_until_done()
+
         # ── Extract final text if not captured ────────────
 
         if not final_text:
@@ -1318,6 +1756,8 @@ def _stream_response(
             "role": "assistant",
             "content": f"Error: {e}",
             "model": None,
+            "session_id": session_id,
+            "thread_id": thread_id,
             "tools_used": [],
             "mermaid_def": err_mdef,
             "mermaid_tooltips": err_tips,
@@ -1326,6 +1766,11 @@ def _stream_response(
             "async_task_snapshot": _capture_async_tasks(),
         })
         return True
+    finally:
+        sse_stop.set()
+        for th in sse_threads:
+            if th.is_alive():
+                th.join(timeout=0.1)
 
 
 # ─────────────────────────────────────────────────────────
@@ -1364,9 +1809,17 @@ def render_chat() -> None:
 
     # Pending prompt: set by Send button, consumed this render cycle
     pending = st.session_state.pop("_pending_prompt", None)
+    pending_session_id = st.session_state.pop("_pending_session_id", None)
+    preset_prompt = st.session_state.pop("_preset_prompt", None)
     if pending:
         st.session_state["_is_running"] = True
+        if not pending_session_id:
+            pending_session_id = f"q-{uuid.uuid4().hex}"
     is_running = st.session_state["_is_running"]
+
+    # chat_input key must be populated before the widget is instantiated.
+    if preset_prompt is not None:
+        st.session_state["_chat_input"] = preset_prompt
 
     # 전송 후 입력창 비우기 — 위젯 렌더링 전에 처리해야 함
     if st.session_state.pop("_clear_prompt", False):
@@ -1390,13 +1843,17 @@ def render_chat() -> None:
         border: 1px solid #bfdbfe;
         border-radius: 16px 16px 4px 16px;
         padding: 14px 18px;
-        margin: 0 0 8px auto;
-        max-width: 92%;
+        margin: 0 0 8px 0;
         font-size: 0.95em;
         color: #1e40af;
         line-height: 1.55;
         word-break: break-word;
         box-shadow: 0 4px 14px rgba(59, 130, 246, .08);
+        display: inline-block;
+    }
+    .user-bubble-wrap {
+        width: 100%;
+        text-align: right;
     }
     .user-bubble-label {
         font-size: .75em;
@@ -1414,7 +1871,6 @@ def render_chat() -> None:
         border-radius: 16px 16px 16px 4px;
         padding: 14px 18px;
         margin: 0 auto 8px 0;
-        max-width: 92%;
         font-size: 0.95em;
         color: #166534;
         line-height: 1.55;
@@ -1422,6 +1878,11 @@ def render_chat() -> None:
         max-height: 500px;
         overflow-y: auto;
         box-shadow: 0 4px 14px rgba(22, 163, 74, .08);
+        display: inline-block;
+    }
+    .agent-bubble-wrap {
+        width: 100%;
+        text-align: left;
     }
     .agent-bubble-label {
         font-size: .75em;
@@ -1437,6 +1898,52 @@ def render_chat() -> None:
         color: #6b7280;
         margin-top: 8px;
     }
+    div[data-testid="stChatInput"] > div {
+        border: 1px solid #cbd5e1;
+        border-radius: 14px;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, .06);
+        background: #ffffff;
+    }
+    .input-shell {
+        padding: 2px 0 0;
+        background: transparent;
+    }
+    .input-shell-label {
+        font-size: .74em;
+        color: #94a3b8;
+        margin: 0 0 6px 4px;
+        letter-spacing: .2px;
+    }
+    div[data-testid="stChatInput"] textarea {
+        font-size: .96em;
+        line-height: 1.55;
+    }
+    div[data-testid="stChatInput"] {
+        margin-top: -4px;
+        margin-right: -8px;
+    }
+    div[data-testid="stButton"] button[kind="primary"] {
+        border-radius: 12px;
+        border: 1px solid #fca5a5;
+        background: linear-gradient(180deg, #ef4444 0%, #dc2626 100%);
+        color: #fff;
+        font-weight: 700;
+        letter-spacing: .2px;
+        box-shadow: 0 6px 16px rgba(220, 38, 38, .22);
+        min-height: 56px;
+        height: 56px;
+    }
+    div[data-testid="stButton"] button[kind="primary"]:hover {
+        background: linear-gradient(180deg, #f87171 0%, #ef4444 100%);
+        border-color: #f87171;
+    }
+    div[data-testid="stButton"] button[kind="secondary"] {
+        border-radius: 10px;
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        color: #334155;
+        box-shadow: none;
+    }
     div[data-testid="stExpander"] {
         border: 1px solid #bbf7d0;
         border-radius: 16px;
@@ -1445,6 +1952,21 @@ def render_chat() -> None:
     }
     div[data-testid="stExpander"] summary {
         color: #166534;
+    }
+    .test-prompt-anchor + div [data-testid="stExpander"] {
+        border: 1px solid #e2e8f0 !important;
+        border-radius: 14px !important;
+        background: #ffffff !important;
+        box-shadow: none !important;
+    }
+    .test-prompt-anchor + div [data-testid="stExpander"] details,
+    .test-prompt-anchor + div [data-testid="stExpander"] > div,
+    .test-prompt-anchor + div [data-testid="stExpander"] > details {
+        background: #ffffff !important;
+    }
+    .test-prompt-anchor + div [data-testid="stExpander"] summary {
+        color: #334155 !important;
+        background: #ffffff !important;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -1455,6 +1977,44 @@ def render_chat() -> None:
     # ── 1. Main content area ─────────────────────────────
     graph_ph = st.empty()
     result_ph_ref = {"ph": None}
+    subagent_ph_ref = {"ph": None}
+
+    def _render_live_interaction():
+        st.markdown(
+            "<div class='agent-bubble-label'>🤖 Agent</div>",
+            unsafe_allow_html=True,
+        )
+        result_ph_ref["ph"] = st.empty()
+        _thinking = "Thinking..."
+        result_ph_ref["ph"].markdown(
+            "<div class='agent-bubble-wrap'>"
+            f"<div class='agent-bubble' style='{_agent_bubble_style(_thinking)}'>"
+            "Thinking...<div class='agent-bubble-model'>Waiting for model output</div>"
+            "</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            "<p style='margin:10px 0 4px;font-size:.8em;font-weight:700;"
+            "color:#64748b;letter-spacing:.4px'>🔍 AGENT 동작 분석</p>",
+            unsafe_allow_html=True,
+        )
+        analysis_col, _ = st.columns([23, 2])
+        with analysis_col:
+            local_graph_ph = st.empty()
+            idle_def, tips = _build_mermaid([], True, pending or "")
+            _render_mermaid(local_graph_ph, idle_def, [], True, num_agents=0, tooltips=tips)
+            subagent_ph_ref["ph"] = st.empty()
+        prompt_display = pending or "(processing…)"
+        _pending_user_style = _user_bubble_style(prompt_display)
+        st.markdown(
+            f"<div class='user-bubble-label'>👤 User</div>"
+            f"<div class='user-bubble-wrap'>"
+            f"<div class='user-bubble' style='{_pending_user_style}'>{_escape_bubble_html(prompt_display)}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        return local_graph_ph
 
     if not has_conversation:
         # ── Idle state: centered title (no heavy Mermaid render) ──
@@ -1473,62 +2033,104 @@ def render_chat() -> None:
     else:
         # ── Active conversation: chat-style layout ────────
 
-        # Show previous conversation pairs (history within session)
-        # Layout: Agent answer → Mermaid analysis → User prompt.
-        _last_user_content = ""
-        _assistant_total = sum(
-            1 for msg in st.session_state.chat_messages
-            if msg["role"] == "assistant"
-        )
-        _assistant_idx = 0
+        # Show conversation history as accumulated turns:
+        # Agent answer → Mermaid analysis → User prompt (repeated, newest last).
+        # While running, keep iframe work light by expanding only latest item.
+        turns_by_session: dict[str, dict] = {}
+        ordered_sessions: list[str] = []
         for msg in st.session_state.chat_messages:
+            sid = str(msg.get("session_id", "legacy"))
+            if sid not in turns_by_session:
+                turns_by_session[sid] = {
+                    "session_id": sid,
+                    "user": "",
+                    "assistant": None,
+                }
+                ordered_sessions.append(sid)
             if msg["role"] == "user":
-                _last_user_content = msg["content"]
-
+                turns_by_session[sid]["user"] = msg.get("content", "")
             elif msg["role"] == "assistant":
-                _assistant_idx += 1
-                _is_latest_assistant = _assistant_idx == _assistant_total
+                turns_by_session[sid]["assistant"] = msg
 
-                model_html = ""
-                if msg.get("model"):
-                    model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(msg['model'])}</div>"
-                safe_content = _escape_bubble_html(msg["content"])
-                st.markdown(
-                    f"<div class='agent-bubble-label'>🤖 Agent</div>"
-                    f"<div class='agent-bubble'>{safe_content}{model_html}</div>",
-                    unsafe_allow_html=True,
+        completed_turns = [
+            turns_by_session[sid]
+            for sid in ordered_sessions
+            if turns_by_session[sid].get("assistant") is not None
+        ]
+
+        for idx, turn in enumerate(completed_turns):
+            msg = turn["assistant"]
+            user_content = turn["user"]
+            _is_latest_assistant = idx == (len(completed_turns) - 1)
+
+            model_html = ""
+            if msg and msg.get("model"):
+                model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(msg['model'])}</div>"
+            safe_content = _escape_bubble_html(msg["content"] if msg else "")
+            st.markdown(
+                f"<div class='agent-bubble-label'>🤖 Agent</div>"
+                f"<div class='agent-bubble-wrap'>"
+                f"<div class='agent-bubble' style='{_agent_bubble_style(msg['content'] if msg else '')}'>{safe_content}{model_html}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            if msg and msg.get("mermaid_def"):
+                _hist_html = _build_page_html(
+                    msg["mermaid_def"],
+                    msg.get("mermaid_events", []),
+                    False,
+                    tooltips=msg.get("mermaid_tooltips", {}),
                 )
+                _h = max(350, 220 + msg.get("num_agents", 0) * 70)
+                analysis_col, _ = st.columns([23, 2])
+                with analysis_col:
+                    with st.expander(
+                        "🔍 Agent 동작 분석",
+                        expanded=(_is_latest_assistant and not is_running),
+                    ):
+                        st.iframe(_hist_html, height=_h)
+                        _snap = msg.get("async_task_snapshot") or []
+                        if _snap:
+                            st.caption(f"Tracked async tasks at completion: {len(_snap)}")
+                            for _task in _snap[:4]:
+                                st.caption(
+                                    f"- {_task.get('task_id', '')[:12]}... "
+                                    f"{_task.get('agent_type', 'unknown')} "
+                                    f"[{_task.get('status', 'unknown')}]"
+                                )
+                        _sub_streams = msg.get("subagent_streams") or []
+                        if _sub_streams:
+                            st.caption(f"SubAgent streamed outputs: {len(_sub_streams)}")
+                            for _row in _sub_streams[:4]:
+                                _icon = AGENT_ICONS.get(str(_row.get("type", "subagent")), "🤖")
+                                _text = str(_row.get("text", "")).strip()[:180]
+                                _meta = []
+                                if _row.get("port"):
+                                    _meta.append(f"127.0.0.1:{_row.get('port')}")
+                                if _row.get("pid"):
+                                    _meta.append(f"pid {_row.get('pid')}")
+                                _meta_text = f" ({', '.join(_meta)})" if _meta else ""
+                                st.caption(
+                                    f"- {_icon} {_row.get('type', 'subagent')} "
+                                    f"{_meta_text} "
+                                    f"[{_row.get('status', 'running')}] "
+                                    f"{_text}"
+                                )
 
-                if msg.get("mermaid_def"):
-                    _hist_html = _build_page_html(
-                        msg["mermaid_def"],
-                        msg.get("mermaid_events", []),
-                        False,
-                        tooltips=msg.get("mermaid_tooltips", {}),
-                    )
-                    _h = max(350, 220 + msg.get("num_agents", 0) * 70)
-                    analysis_col, _ = st.columns([23, 2])
-                    with analysis_col:
-                        with st.expander("🔍 Agent 동작 분석", expanded=_is_latest_assistant):
-                            st.iframe(_hist_html, height=_h)
-                            _snap = msg.get("async_task_snapshot") or []
-                            if _snap:
-                                st.caption(f"Tracked async tasks at completion: {len(_snap)}")
-                                for _task in _snap[:4]:
-                                    st.caption(
-                                        f"- {_task.get('task_id', '')[:12]}... "
-                                        f"{_task.get('agent_type', 'unknown')} "
-                                        f"[{_task.get('status', 'unknown')}]"
-                                    )
+            _user_style = _user_bubble_style(user_content)
+            st.markdown(
+                f"<div class='user-bubble-label'>👤 User</div>"
+                f"<div class='user-bubble-wrap'>"
+                f"<div class='user-bubble' style='{_user_style}'>{_escape_bubble_html(user_content)}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-                st.markdown(
-                    f"<div class='user-bubble-label'>👤 User</div>"
-                    f"<div class='user-bubble'>{_escape_bubble_html(_last_user_content)}</div>",
-                    unsafe_allow_html=True,
-                )
-
-                st.markdown("<hr style='border:none;border-top:1px solid #e2e8f0;margin:12px 0'>",
-                            unsafe_allow_html=True)
+            st.markdown(
+                "<hr style='border:none;border-top:1px solid #e2e8f0;margin:12px 0'>",
+                unsafe_allow_html=True,
+            )
 
         # ── Live interaction area (current pending/running) ──
         # Layout: Agent progress/answer → Mermaid analysis → User prompt.
@@ -1539,10 +2141,12 @@ def render_chat() -> None:
             )
             result_ph_ref["ph"] = st.empty()
             if pending or is_running:
+                _thinking = "Thinking..."
                 result_ph_ref["ph"].markdown(
-                    "<div class='agent-bubble'>"
+                    "<div class='agent-bubble-wrap'>"
+                    f"<div class='agent-bubble' style='{_agent_bubble_style(_thinking)}'>"
                     "Thinking...<div class='agent-bubble-model'>Waiting for model output</div>"
-                    "</div>",
+                    "</div></div>",
                     unsafe_allow_html=True,
                 )
 
@@ -1556,15 +2160,20 @@ def render_chat() -> None:
                 graph_ph = st.empty()
                 idle_def, tips = _build_mermaid([], True, pending or "")
                 _render_mermaid(graph_ph, idle_def, [], True, num_agents=0, tooltips=tips)
+                subagent_ph_ref["ph"] = st.empty()
 
             prompt_display = pending or "(processing…)"
+            _pending_user_style = _user_bubble_style(prompt_display)
             st.markdown(
                 f"<div class='user-bubble-label'>👤 User</div>"
-                f"<div class='user-bubble'>{_escape_bubble_html(prompt_display)}</div>",
+                f"<div class='user-bubble-wrap'>"
+                f"<div class='user-bubble' style='{_pending_user_style}'>{_escape_bubble_html(prompt_display)}</div>"
+                f"</div>",
                 unsafe_allow_html=True,
             )
         else:
             result_ph_ref["ph"] = st.empty()
+            subagent_ph_ref["ph"] = st.empty()
 
     # ── Bottom section: Prompt presets + Input ────────────
     st.markdown(
@@ -1572,59 +2181,35 @@ def render_chat() -> None:
         unsafe_allow_html=True,
     )
 
-    # ── Prompt 프리셋 버튼 ────────────────────────────────
-    st.markdown(
-        "<p style='margin:4px 0 6px;font-size:.8em;font-weight:700;"
-        "color:#64748b;letter-spacing:.4px'>📌 PROMPT</p>",
-        unsafe_allow_html=True,
+    # ── Enter-to-send input ──────────────────────────────
+    st.markdown("<div class='input-shell'>", unsafe_allow_html=True)
+    user_input = st.chat_input(
+        "Type your message and press Enter",
+        key="_chat_input",
+        disabled=is_running,
     )
-    tp_cols = st.columns(len(TEST_PROMPTS))
-    for i, (label, p) in enumerate(TEST_PROMPTS.items()):
-        with tp_cols[i]:
-            if st.button(
-                f"▶ {label}",
-                key=f"test_{label}",
-                use_container_width=True,
-                disabled=is_running,
-            ):
-                st.session_state["_prompt_area"] = p
-                st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── 질의 입력창 카드 ──────────────────────────────────
-    with st.container(border=True):
-        user_input = st.text_area(
-            "prompt",
-            key="_prompt_area",
-            height=80,
-            disabled=is_running,
-            label_visibility="collapsed",
-            placeholder="Ask me anything about coding…",
-        )
-        action_spacer, stop_col, send_col = st.columns([4, 1, 1])
-        with stop_col:
-            stop_clicked = st.button(
-                "⏹ Stop",
-                use_container_width=True,
-                disabled=not is_running,
-                type="secondary",
-            )
-        with send_col:
-            send_clicked = st.button(
-                "🚀 Send",
-                use_container_width=True,
-                disabled=is_running,
-                type="primary",
-            )
-    if send_clicked:
-        if user_input and user_input.strip():
-            st.session_state["_pending_prompt"] = user_input.strip()
-            st.session_state["_clear_prompt"] = True
-            st.rerun()
-        else:
-            st.info("메시지를 입력한 뒤 Send를 눌러주세요.")
-    if stop_clicked:
-        st.session_state["_stop_requested"] = True
+    if user_input and user_input.strip():
+        st.session_state["_pending_prompt"] = user_input.strip()
+        st.session_state["_pending_session_id"] = f"q-{uuid.uuid4().hex}"
         st.rerun()
+
+    # ── Test Prompt 프리셋 버튼 ──────────────────────────
+    st.markdown("<div class='test-prompt-anchor'></div>", unsafe_allow_html=True)
+    with st.expander("Test Prompt", expanded=False):
+        tp_cols = st.columns(len(TEST_PROMPTS))
+        for i, (label, p) in enumerate(TEST_PROMPTS.items()):
+            with tp_cols[i]:
+                if st.button(
+                    label,
+                    key=f"test_{label}",
+                    use_container_width=True,
+                    disabled=is_running,
+                    type="secondary",
+                ):
+                    st.session_state["_preset_prompt"] = p
+                    st.rerun()
 
     # ── Pending prompt 실행 ───────────────────────────────
     if pending:
@@ -1633,7 +2218,13 @@ def render_chat() -> None:
         st.session_state["_is_running"] = True
         completed = False
         try:
-            completed = _stream_response(pending, graph_ph, result_ph_ref["ph"])
+            completed = _stream_response(
+                pending,
+                graph_ph,
+                result_ph_ref["ph"],
+                subagent_ph=subagent_ph_ref["ph"],
+                query_session_id=pending_session_id,
+            )
         finally:
             st.session_state["_is_running"] = False
             st.session_state["_has_result"] = completed

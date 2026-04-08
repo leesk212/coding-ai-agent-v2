@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
 
 from coding_agent.config import settings
@@ -54,6 +55,13 @@ def _init_db() -> None:
             status       TEXT NOT NULL DEFAULT 'pending',
             created_at   TEXT NOT NULL,
             error        TEXT
+        );
+        CREATE TABLE IF NOT EXISTS run_events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            event_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL
         );
     """)
     _CONN.commit()
@@ -115,13 +123,47 @@ def _bootstrap_agent():
     )
 
 
+def _append_run_event(run_id: str, event_type: str, payload: dict[str, Any]) -> None:
+    _CONN.execute(
+        "INSERT INTO run_events (run_id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
+        (run_id, event_type, json.dumps(payload), datetime.now(UTC).isoformat()),
+    )
+    _CONN.commit()
+
+
 async def _execute_run(run_id: str, thread_id: str, user_message: str) -> None:
     _CONN.execute("UPDATE runs SET status = 'running' WHERE run_id = ?", (run_id,))
     _CONN.commit()
+    _append_run_event(run_id, "status", {"status": "running"})
     try:
-        result = await _AGENT.ainvoke({"messages": [HumanMessage(user_message)]})
-        last = result["messages"][-1]
-        output = last.content if isinstance(last.content, str) else json.dumps(last.content)
+        output_chunks: list[str] = []
+        async for event in _AGENT.astream_events(
+            {"messages": [HumanMessage(user_message)]},
+            version="v2",
+        ):
+            if event.get("event") != "on_chat_model_stream":
+                continue
+            chunk = (event.get("data") or {}).get("chunk")
+            content = getattr(chunk, "content", "")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict):
+                        parts.append(str(block.get("text", "")))
+                text = "".join(parts)
+            if text:
+                output_chunks.append(text)
+                _append_run_event(run_id, "token", {"text": text})
+
+        output = "".join(output_chunks).strip()
+        if not output:
+            result = await _AGENT.ainvoke({"messages": [HumanMessage(user_message)]})
+            last = result["messages"][-1]
+            output = last.content if isinstance(last.content, str) else json.dumps(last.content)
+
         assistant_msg = {"role": "assistant", "content": output}
         row = _CONN.execute(
             "SELECT messages FROM threads WHERE thread_id = ?",
@@ -136,12 +178,14 @@ async def _execute_run(run_id: str, thread_id: str, user_message: str) -> None:
         )
         _CONN.execute("UPDATE runs SET status = 'success' WHERE run_id = ?", (run_id,))
         _CONN.commit()
+        _append_run_event(run_id, "final", {"text": output, "status": "success"})
     except Exception as exc:  # noqa: BLE001
         _CONN.execute(
             "UPDATE runs SET status = 'error', error = ? WHERE run_id = ?",
             (str(exc), run_id),
         )
         _CONN.commit()
+        _append_run_event(run_id, "error", {"error": str(exc), "status": "error"})
 
 
 @asynccontextmanager
@@ -251,7 +295,53 @@ async def cancel_run(thread_id: str, run_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Run not found")
     _CONN.execute("UPDATE runs SET status = 'cancelled' WHERE run_id = ?", (run_id,))
     _CONN.commit()
+    _append_run_event(run_id, "status", {"status": "cancelled"})
     return {**run, "status": "cancelled"}
+
+
+@app.get("/threads/{thread_id}/runs/{run_id}/stream")
+async def stream_run_events(thread_id: str, run_id: str, after: int = 0):
+    run = _get_run(run_id)
+    if run is None or run["thread_id"] != thread_id:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    async def _event_generator():
+        last_seq = int(after)
+        terminal = {"success", "error", "cancelled"}
+        while True:
+            rows = _CONN.execute(
+                """
+                SELECT seq, event_type, payload
+                FROM run_events
+                WHERE run_id = ? AND seq > ?
+                ORDER BY seq ASC
+                """,
+                (run_id, last_seq),
+            ).fetchall()
+
+            for row in rows:
+                last_seq = int(row["seq"])
+                payload = row["payload"]
+                yield f"id: {last_seq}\n"
+                yield f"event: {row['event_type']}\n"
+                yield f"data: {payload}\n\n"
+
+            latest = _get_run(run_id)
+            if latest is None:
+                break
+            if str(latest.get("status", "")).lower() in terminal and not rows:
+                break
+            await asyncio.sleep(0.2)
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def main() -> None:

@@ -6,6 +6,7 @@ Uses OpenRouter open-source models as primary, with Ollama local fallback.
 from __future__ import annotations
 
 import os
+from importlib.util import find_spec
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,7 +20,7 @@ class ModelSpec:
     """Specification for an LLM model."""
 
     name: str
-    provider: str  # "openrouter" or "ollama"
+    provider: str  # "openrouter", "openai", or "ollama"
     priority: int  # lower = preferred
 
     def __hash__(self) -> int:
@@ -29,6 +30,8 @@ class ModelSpec:
         """Convert to DeepAgents CLI model string format: 'provider:model_name'."""
         if self.provider == "openrouter":
             return f"openrouter:{self.name}"
+        elif self.provider == "openai":
+            return f"openai:{self.name}"
         elif self.provider == "ollama":
             return f"ollama:{self.name}"
         return self.name
@@ -51,6 +54,13 @@ DEFAULT_LOCAL_MODEL = ModelSpec(
     priority=99,
 )
 
+# Cloud fallback model (OpenAI / ChatGPT)
+DEFAULT_OPENAI_MODEL = ModelSpec(
+    name=os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4o-mini"),
+    provider="openai",
+    priority=90,
+)
+
 
 @dataclass
 class Settings:
@@ -60,6 +70,9 @@ class Settings:
     openrouter_api_key: str = field(
         default_factory=lambda: os.getenv("OPENROUTER_API_KEY", "")
     )
+    openai_api_key: str = field(
+        default_factory=lambda: os.getenv("OPENAI_API_KEY", "")
+    )
 
     # Ollama
     ollama_base_url: str = field(
@@ -68,6 +81,7 @@ class Settings:
 
     # Model configuration
     model_priority: list[ModelSpec] = field(default_factory=lambda: list(DEFAULT_MODELS))
+    openai_fallback_model: ModelSpec = field(default_factory=lambda: DEFAULT_OPENAI_MODEL)
     local_fallback_model: ModelSpec = field(default_factory=lambda: DEFAULT_LOCAL_MODEL)
 
     # Memory
@@ -90,6 +104,9 @@ class Settings:
 
     # Agentic loop
     max_iterations: int = 25
+    recursion_limit: int = field(
+        default_factory=lambda: int(os.getenv("RECURSION_LIMIT", "100"))
+    )
     model_timeout: float = 60.0
     circuit_breaker_threshold: int = 3
     circuit_breaker_reset: float = 300.0  # 5 minutes
@@ -98,12 +115,22 @@ class Settings:
     def has_openrouter(self) -> bool:
         return bool(self.openrouter_api_key)
 
+    @property
+    def has_openai(self) -> bool:
+        return bool(self.openai_api_key)
+
+    @property
+    def has_ollama_client(self) -> bool:
+        return bool(find_spec("langchain_ollama") or find_spec("langchain_community"))
+
     def get_all_models(self) -> list[ModelSpec]:
-        """Return all models in priority order, including local fallback."""
-        return sorted(
-            self.model_priority + [self.local_fallback_model],
-            key=lambda m: m.priority,
-        )
+        """Return all models in priority order with cloud and local fallbacks."""
+        all_models = list(self.model_priority)
+        if self.has_openai:
+            all_models.append(self.openai_fallback_model)
+        if self.has_ollama_client:
+            all_models.append(self.local_fallback_model)
+        return sorted(all_models, key=lambda m: m.priority)
 
     @property
     def primary_model_string(self) -> str:

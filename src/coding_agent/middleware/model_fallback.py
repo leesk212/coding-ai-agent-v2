@@ -82,6 +82,14 @@ def create_model(spec: ModelSpec) -> BaseChatModel:
             },
             timeout=settings.model_timeout,
         )
+    elif spec.provider == "openai":
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=spec.name,
+            api_key=settings.openai_api_key,
+            timeout=settings.model_timeout,
+        )
     elif spec.provider == "ollama":
         try:
             from langchain_ollama import ChatOllama
@@ -90,11 +98,17 @@ def create_model(spec: ModelSpec) -> BaseChatModel:
                 base_url=settings.ollama_base_url,
             )
         except ImportError:
-            from langchain_community.chat_models import ChatOllama as CommunityChatOllama
-            return CommunityChatOllama(
-                model=spec.name,
-                base_url=settings.ollama_base_url,
-            )
+            try:
+                from langchain_community.chat_models import ChatOllama as CommunityChatOllama
+
+                return CommunityChatOllama(
+                    model=spec.name,
+                    base_url=settings.ollama_base_url,
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Ollama fallback requires `langchain-ollama` or `langchain-community`."
+                ) from exc
     else:
         raise ValueError(f"Unknown provider: {spec.provider}")
 
@@ -146,9 +160,22 @@ class ModelFallbackMiddleware(AgentMiddleware):
             self.breakers[local.name].state = CircuitState.HALF_OPEN
             available = [local]
 
-        spec = available[0]
-        self._current_model_name = spec.name
-        return self._get_model(spec)
+        errors: list[str] = []
+        for spec in available:
+            breaker = self.breakers[spec.name]
+            try:
+                model = self._get_model(spec)
+                self._current_model_name = spec.name
+                return model
+            except Exception as e:
+                breaker.record_failure()
+                err = f"{spec.name}: {type(e).__name__}: {e}"
+                errors.append(err)
+                logger.warning("Skipping unavailable model during selection: %s", err)
+                continue
+
+        error_summary = "\n".join(errors) if errors else "No model candidates available."
+        raise RuntimeError(f"No usable models available. Errors:\n{error_summary}")
 
     def invoke_with_fallback(
         self,
@@ -170,9 +197,9 @@ class ModelFallbackMiddleware(AgentMiddleware):
 
         for spec in available:
             breaker = self.breakers[spec.name]
-            model = self._get_model(spec)
 
             try:
+                model = self._get_model(spec)
                 logger.info("Trying model: %s (%s)", spec.name, spec.provider)
                 response = model.invoke(messages, **kwargs)
                 breaker.record_success()
@@ -206,9 +233,9 @@ class ModelFallbackMiddleware(AgentMiddleware):
 
         for spec in available:
             breaker = self.breakers[spec.name]
-            model = self._get_model(spec)
 
             try:
+                model = self._get_model(spec)
                 logger.info("Trying model: %s (%s)", spec.name, spec.provider)
 
                 if spec.provider == "ollama":
@@ -257,9 +284,9 @@ class ModelFallbackMiddleware(AgentMiddleware):
 
         for spec in available:
             breaker = self.breakers[spec.name]
-            model = self._get_model(spec)
 
             try:
+                model = self._get_model(spec)
                 modified_request = request.override(model=model)
                 response = handler(modified_request)
                 breaker.record_success()
@@ -287,9 +314,9 @@ class ModelFallbackMiddleware(AgentMiddleware):
 
         for spec in available:
             breaker = self.breakers[spec.name]
-            model = self._get_model(spec)
 
             try:
+                model = self._get_model(spec)
                 modified_request = request.override(model=model)
 
                 if spec.provider == "ollama":

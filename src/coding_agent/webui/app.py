@@ -41,7 +41,6 @@ def _init_state():
         "init_error": None,
         "page": "chat",
         "mem_count": 0,
-        "_conversation_thread_id": f"webui-{uuid.uuid4().hex}",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -56,8 +55,8 @@ def _reset_chat_state() -> None:
     st.session_state["chat_messages"] = []
     st.session_state["_prompt_area"] = ""
     st.session_state["_clear_prompt"] = True
-    st.session_state["_conversation_thread_id"] = f"webui-{uuid.uuid4().hex}"
     st.session_state.pop("_pending_prompt", None)
+    st.session_state.pop("_pending_session_id", None)
 
 
 def _init_agent():
@@ -85,35 +84,89 @@ def _init_agent():
             log_area.code("\n".join(logs), language="text")
 
         try:
-            log("⚙️", "Loading configuration...", 10)
+            log("INFO", "Initializing web UI runtime...", 3)
+            t0 = time.time()
+            log("STEP", "Loading configuration module...", 8)
             from coding_agent.config import settings
+            log("DONE", f"Configuration loaded in {time.time()-t0:.1f}s", 10)
             key_ok = "✓" if settings.openrouter_api_key else "✗ NOT SET"
-            log("🔑", f"API Key: {key_ok}", 15)
+            openai_ok = "✓" if settings.openai_api_key else "✗ NOT SET"
+            log("KEY", f"OpenRouter key: {key_ok} | OpenAI key: {openai_ok}", 13)
             models = settings.get_all_models()
-            log("🧪", f"Models: {len(models)} configured", 20)
+            model_names = ", ".join(m.name for m in models[:4])
+            if len(models) > 4:
+                model_names += ", ..."
+            log("MODEL", f"Models configured: {len(models)} [{model_names}]", 17)
+            log(
+                "INFO",
+                (
+                    "Initialization may pause on first run while imports, memory backend, "
+                    "and local subagent health checks complete."
+                ),
+                20,
+            )
 
             t0 = time.time()
-            log("🧠", "Initializing ChromaDB memory...", 35)
+            log("STEP", f"Initializing memory backend at {settings.memory_dir} ...", 26)
             from coding_agent.middleware.long_term_memory import LongTermMemoryMiddleware
             ltm_mw = LongTermMemoryMiddleware(memory_dir=str(settings.memory_dir))
             total = sum(ltm_mw.store.get_stats().values())
             st.session_state.mem_count = total
-            log("✅", f"Memory ready ({total} entries) — {time.time()-t0:.1f}s", 40)
+            log(
+                "DONE",
+                f"Memory backend ready ({total} entries) in {time.time()-t0:.1f}s",
+                36,
+            )
 
             t0 = time.time()
-            log("🏗️", "Creating DeepAgents supervisor...", 55)
+            log("STEP", f"Building DeepAgents supervisor for cwd={Path.cwd()} ...", 42)
             from coding_agent.agent import create_coding_agent
             components = create_coding_agent(cwd=Path.cwd())
-            log("✅", f"DeepAgents supervisor ready — {time.time()-t0:.1f}s", 90)
+            log(
+                "DONE",
+                f"DeepAgents supervisor ready in {time.time()-t0:.1f}s",
+                62,
+            )
 
             t0 = time.time()
-            log("🤖", "Starting local async subagent processes...", 92)
+            log("STEP", "Preparing local async subagent processes...", 68)
             manager = components["subagent_manager"]
+            try:
+                configured = manager.get_all_tasks()
+            except Exception:
+                configured = []
+            if configured:
+                for row in configured:
+                    log(
+                        "AGENT",
+                        (
+                            f"{row.get('agent_type', 'subagent')} -> {row.get('url', '?')} "
+                            f"(status={row.get('status', 'unknown')}, pid={row.get('pid')})"
+                        ),
+                        70,
+                    )
+            log(
+                "STEP",
+                "Starting subagent processes and waiting for /ok health checks ...",
+                76,
+            )
             specs = manager.ensure_all_started()
-            log("✅", f"Async subagents healthy ({len(specs)}) — {time.time()-t0:.1f}s", 97)
+            for spec in specs:
+                pid = spec.pid if spec.pid is not None else "external"
+                mode = "external" if spec.external else "local"
+                log(
+                    "OK",
+                    f"{spec.name} healthy on {spec.url} (pid={pid}, mode={mode})",
+                    90,
+                )
+            log(
+                "DONE",
+                f"All async subagents healthy ({len(specs)}) in {time.time()-t0:.1f}s",
+                97,
+            )
 
             total_elapsed = time.time() - t_init_start
-            log("🚀", f"Ready! (total {total_elapsed:.1f}s)", 100)
+            log("READY", f"Ready. Total initialization time: {total_elapsed:.1f}s", 100)
 
             st.session_state.agent_components = components
             st.session_state.initialized = True
@@ -174,10 +227,10 @@ def main():
             'display:flex;gap:.9rem;align-items:center;z-index:9999;">'
             '<a href="?page=settings" target="_self" '
             'style="font-size:0.85rem;color:#64748b;text-decoration:none;">'
-            '⚙️ Settings</a>'
+            'Settings</a>'
             '<a href="?page=chat&refresh=1" target="_self" '
             'style="font-size:0.85rem;color:#64748b;text-decoration:none;">'
-            '🔄 Refresh</a>'
+            'Refresh</a>'
             '</div>',
             unsafe_allow_html=True,
         )

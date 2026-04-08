@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from langchain.agents.middleware.types import AgentMiddleware
+from langchain_core.messages import SystemMessage
 
 
 COMPLETION_POLICY_PROMPT = """
@@ -26,8 +27,23 @@ class AsyncTaskCompletionMiddleware(AgentMiddleware):
     """Append completion-first async task guidance to the system prompt."""
 
     def _inject_policy(self, request):
-        current_system = getattr(request, "system_message", "") or ""
-        new_system = f"{current_system}\n\n{COMPLETION_POLICY_PROMPT}".strip()
+        current_system = getattr(request, "system_message", None)
+        if isinstance(current_system, SystemMessage):
+            existing_blocks = list(current_system.content_blocks)
+            if existing_blocks:
+                text = f"\n\n{COMPLETION_POLICY_PROMPT}"
+            else:
+                text = COMPLETION_POLICY_PROMPT
+            new_system = SystemMessage(
+                content_blocks=[*existing_blocks, {"type": "text", "text": text}]
+            )
+        else:
+            current_text = str(current_system or "").strip()
+            if current_text:
+                combined = f"{current_text}\n\n{COMPLETION_POLICY_PROMPT}"
+            else:
+                combined = COMPLETION_POLICY_PROMPT
+            new_system = SystemMessage(content_blocks=[{"type": "text", "text": combined}])
         try:
             return request.override(system_message=new_system)
         except (AttributeError, TypeError):
