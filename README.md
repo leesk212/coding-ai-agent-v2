@@ -98,6 +98,16 @@ CLI 명령:
 python -m coding_agent --debug
 ```
 
+## 테스트 실행
+
+```bash
+# 전체 테스트
+python -m unittest discover -s tests -p "test_*.py"
+
+# 코드 작성 + 리뷰 워크플로우 테스트만 실행
+python -m unittest tests.test_code_review_workflow
+```
+
 ## Async SubAgent 런타임 설정
 
 `Settings` 페이지 또는 환경 변수로 조정:

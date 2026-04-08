@@ -47,6 +47,11 @@ TEST_PROMPTS = {
         "If there are any completed async tasks in this conversation, collect their results and summarize them. "
         "If not, list the tracked async tasks."
     ),
+    "Code+Review Test": (
+        "Launch two async tasks and stop after launch: "
+        "1) code_writer to implement a fibonacci function with type hints and docstring, "
+        "2) reviewer to review correctness, edge cases, and test coverage gaps."
+    ),
     "Fallback Test": "Write a simple hello world in Python",
 }
 
