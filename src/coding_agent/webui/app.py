@@ -1,23 +1,12 @@
-"""Danny's Coding AI Agent — Single-page WebUI.
-
-Run with: python -m coding_agent --webui
-"""
+"""Danny's Coding AI Agent — Single-page WebUI."""
 
 import logging
 import time
 import traceback
+import uuid
+from pathlib import Path
 
 import streamlit as st
-
-from coding_agent.agent import SYSTEM_PROMPT
-
-WEBUI_SYSTEM_PROMPT = (
-    SYSTEM_PROMPT
-    + "\n\n## WebUI Flow Visualization\n"
-    + "- If both `task` and `spawn_subagent` are available for delegation, prefer "
-    + "`task(description, subagent_type)` because it is DeepAgents' native "
-    + "subagent tool and is visualized in the WebUI flow chart.\n"
-)
 
 st.set_page_config(
     page_title="Danny's Coding AI Agent",
@@ -52,6 +41,7 @@ def _init_state():
         "init_error": None,
         "page": "chat",
         "mem_count": 0,
+        "_conversation_thread_id": f"webui-{uuid.uuid4().hex}",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -66,6 +56,7 @@ def _reset_chat_state() -> None:
     st.session_state["chat_messages"] = []
     st.session_state["_prompt_area"] = ""
     st.session_state["_clear_prompt"] = True
+    st.session_state["_conversation_thread_id"] = f"webui-{uuid.uuid4().hex}"
     st.session_state.pop("_pending_prompt", None)
 
 
@@ -110,93 +101,21 @@ def _init_agent():
             log("✅", f"Memory ready ({total} entries) — {time.time()-t0:.1f}s", 40)
 
             t0 = time.time()
-            log("🔄", "Building model fallback chain...", 55)
-            from coding_agent.middleware.model_fallback import ModelFallbackMiddleware
-            fallback_mw = ModelFallbackMiddleware(models=models, timeout=settings.model_timeout)
-            log("✅", f"Fallback chain ready — {time.time()-t0:.1f}s", 60)
+            log("🏗️", "Creating DeepAgents supervisor...", 55)
+            from coding_agent.agent import create_coding_agent
+            components = create_coding_agent(cwd=Path.cwd())
+            log("✅", f"DeepAgents supervisor ready — {time.time()-t0:.1f}s", 90)
 
             t0 = time.time()
-            log("🤖", "Setting up SubAgent system...", 70)
-            from coding_agent.middleware.subagent_lifecycle import SubAgentLifecycleMiddleware
-            primary_model = fallback_mw.get_model_with_fallback()
-            subagent_mw = SubAgentLifecycleMiddleware(model=primary_model, max_concurrent=settings.max_subagents)
-            log("✅", f"SubAgents ready (max {settings.max_subagents}) — {time.time()-t0:.1f}s", 75)
-
-            t0 = time.time()
-            log("🏗️", "Creating agent...", 85)
-            from coding_agent.agent import AgentLoopGuard
-            loop_guard = AgentLoopGuard(max_iterations=settings.max_iterations)
-            custom_tools = ltm_mw.get_tools() + subagent_mw.get_tools()
-            log("🔧", f"Tools: {', '.join(t.name for t in custom_tools)}", 88)
-
-            agent, backend = None, None
-            _deepagents_error: str | None = None
-
-            # ── Step 1: verify deepagents_cli can be imported ────────
-            try:
-                import inspect
-                from deepagents_cli.agent import create_cli_agent  # noqa: PLC0415
-                _deepagents_import_ok = True
-            except ImportError as _ie:
-                _deepagents_import_ok = False
-                _deepagents_error = (
-                    f"ImportError: {_ie}\n"
-                    f"Python: {__import__('sys').version.split()[0]}  "
-                    f"(deepagents-cli requires ≥ 3.11)"
-                )
-                log("⚠️", f"deepagents_cli import failed: {_ie}", 92)
-
-            # ── Step 2: try to build the agent ────────────────────────
-            if _deepagents_import_ok:
-                try:
-                    kwargs = {
-                        "model": settings.primary_model_string,
-                        "assistant_id": "coding-ai-agent",
-                        "tools": custom_tools,
-                        "system_prompt": WEBUI_SYSTEM_PROMPT,
-                        "interactive": False,
-                        "auto_approve": True,
-                        "enable_memory": True,
-                        "enable_skills": True,
-                        "enable_shell": True,
-                        "cwd": str(settings.memory_dir.parent),
-                    }
-                    try:
-                        sig = inspect.signature(create_cli_agent)
-                        supported = set(sig.parameters.keys())
-                        if not any(
-                            p.kind == inspect.Parameter.VAR_KEYWORD
-                            for p in sig.parameters.values()
-                        ):
-                            kwargs = {k: v for k, v in kwargs.items() if k in supported}
-                    except (ValueError, TypeError):
-                        pass
-                    agent, backend = create_cli_agent(**kwargs)
-                    log("✅", f"DeepAgents CLI agent created — {time.time()-t0:.1f}s", 95)
-                except Exception as _ce:
-                    _deepagents_error = f"{type(_ce).__name__}: {_ce}"
-                    log("⚠️", f"create_cli_agent failed: {_ce}", 92)
-
-            # ── Step 3: LangGraph fallback if anything above failed ───
-            if agent is None:
-                _reason = _deepagents_error or "unknown error"
-                log("🔄", f"LangGraph fallback (reason: {_reason[:80]})", 92)
-                from langgraph.prebuilt import create_react_agent  # noqa: PLC0415
-                agent = create_react_agent(
-                    model=primary_model,
-                    tools=custom_tools,
-                    prompt="You are Danny's Coding AI Agent.",
-                )
-                log("✅", f"LangGraph agent created — {time.time()-t0:.1f}s", 95)
+            log("🤖", "Starting local async subagent processes...", 92)
+            manager = components["subagent_manager"]
+            specs = manager.ensure_all_started()
+            log("✅", f"Async subagents healthy ({len(specs)}) — {time.time()-t0:.1f}s", 97)
 
             total_elapsed = time.time() - t_init_start
             log("🚀", f"Ready! (total {total_elapsed:.1f}s)", 100)
 
-            st.session_state.agent_components = {
-                "agent": agent, "backend": backend,
-                "fallback_middleware": fallback_mw, "memory_middleware": ltm_mw,
-                "subagent_middleware": subagent_mw, "loop_guard": loop_guard,
-            }
+            st.session_state.agent_components = components
             st.session_state.initialized = True
 
         except Exception as e:

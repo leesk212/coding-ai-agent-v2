@@ -16,7 +16,9 @@ Layout (top → bottom):
 └──────────────────────────────────────────────────────────┘
 """
 
+import json
 import logging
+import re
 import time
 import traceback
 
@@ -31,18 +33,19 @@ AGENT_ICONS = {
 }
 
 TEST_PROMPTS = {
-    "SubAgent Test": (
-        "Analyze the following task by spawning sub-agents: "
-        "1) A researcher to investigate best practices for Python error handling, "
-        "2) A code_writer to write an example implementation"
+    "Async Launch": (
+        "Launch two async tasks: "
+        "1) a researcher to investigate best practices for Python error handling, "
+        "2) a code_writer to draft an example implementation. "
+        "Report the task IDs and stop after launching."
     ),
     "Memory Test": (
         "Remember that I prefer Python type hints and Google-style docstrings. "
         "Then search memory to confirm it was saved."
     ),
-    "Multi-Agent Review": (
-        "I need you to: spawn a code_writer to create a fibonacci function, "
-        "then spawn a reviewer to review the code quality"
+    "Async Collect": (
+        "If there are any completed async tasks in this conversation, collect their results and summarize them. "
+        "If not, list the tracked async tasks."
     ),
     "Fallback Test": "Write a simple hello world in Python",
 }
@@ -194,6 +197,10 @@ def _build_mermaid(
     # ── SubAgents ─────────────────────────────────────────
     for i, a in enumerate(agents):
         detail = a["status"]
+        if a.get("last_action"):
+            detail += f" · {a['last_action']}"
+        if a.get("task_id"):
+            detail += f" {a['task_id'][:8]}"
         if a.get("elapsed"):
             detail += f" {a['elapsed']}s"
 
@@ -244,6 +251,7 @@ def _build_mermaid(
         "pending":   "fill:#fffbeb,stroke:#f59e0b,stroke-width:2px,color:#92400e",
         "running":   "fill:#dcfce7,stroke:#16a34a,stroke-width:3px,color:#166534",
         "completed": "fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#475569",
+        "cancelled": "fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#9a3412",
         "failed":    "fill:#fef2f2,stroke:#ef4444,stroke-width:2px,color:#991b1b",
     }
     for i, a in enumerate(agents):
@@ -276,6 +284,12 @@ def _build_mermaid(
         if a.get("result_summary"):
             result_label = _edge_label(a.get("result_summary", ""), "result")
             _add_tooltip(tooltips, result_label, a["result_summary"])
+
+        if a.get("task_id"):
+            task_meta = f"task_id: {a['task_id']}"
+            if a.get("run_id"):
+                task_meta += f"\nrun_id: {a['run_id']}"
+            _add_tooltip(tooltips, _edge_label(a.get("query", ""), f"{a['type']} task"), (a.get("query", "") + "\n\n" + task_meta).strip())
 
     return "\n".join(lines), tooltips
 
@@ -560,7 +574,6 @@ def _stream_response(
     prompt: str,
     graph_ph,
     result_ph,
-    sa_mw,
 ) -> bool:
     """Stream agent response — update flowchart, event feed, and result."""
     comp = st.session_state.agent_components
@@ -574,10 +587,14 @@ def _stream_response(
     st.session_state.chat_messages.append({"role": "user", "content": prompt})
     loop_guard.reset()
 
-    # ── Per-query unique thread ID (각 질의는 독립적 대화 컨텍스트) ──
-    import uuid as _uuid
-    query_id = _uuid.uuid4().hex[:8]
-    config = {"configurable": {"thread_id": f"webui-{query_id}"}}
+    # ── Stable per-conversation thread ID ────────────────────
+    thread_id = st.session_state.get("_conversation_thread_id")
+    if not thread_id:
+        import uuid as _uuid
+
+        thread_id = f"webui-{_uuid.uuid4().hex}"
+        st.session_state["_conversation_thread_id"] = thread_id
+    config = {"configurable": {"thread_id": thread_id}}
     inputs = {"messages": [HumanMessage(content=prompt)]}
 
     final_text = ""
@@ -589,10 +606,11 @@ def _stream_response(
     t_start = time.time()
     history_snapshot_saved = False
 
-    # Local SubAgent tracking — 질의별 독립 (registry는 세션 공유이므로 사용하지 않음)
+    # Local SubAgent tracking — 질의별 독립
     tracked_agents: list[dict] = []
     _sa_counter = [0]  # mutable counter for unique IDs
     tool_call_agents: dict[str, int] = {}
+    tool_call_actions: dict[str, str] = {}
 
     # ── helpers ───────────────────────────────────────────
 
@@ -601,6 +619,16 @@ def _stream_response(
 
     def _is_stop_requested() -> bool:
         return bool(st.session_state.get("_stop_requested"))
+
+    def _capture_async_tasks() -> list[dict]:
+        tracker = comp.get("async_task_tracker")
+        if not tracker:
+            return []
+        try:
+            rows = tracker.get_tasks(thread_id)
+            return rows if isinstance(rows, list) else []
+        except Exception:
+            return []
 
     def _persist_history_snapshot(content: str, model: str, events_working: bool = False) -> None:
         nonlocal history_snapshot_saved
@@ -624,6 +652,7 @@ def _stream_response(
             "mermaid_tooltips": final_tips,
             "mermaid_events": list(events),
             "num_agents": len(final_agents),
+            "async_task_snapshot": _capture_async_tasks(),
         })
         history_snapshot_saved = True
 
@@ -676,21 +705,25 @@ def _stream_response(
             return tool_call.get(key, default)
         return getattr(tool_call, key, default)
 
+    def _is_subagent_spawn_tool(tool_name: str) -> bool:
+        return tool_name == "start_async_task"
+
     def _is_subagent_tool(tool_name: str) -> bool:
-        return tool_name in ("spawn_subagent", "task")
+        return tool_name in (
+            "start_async_task",
+            "check_async_task",
+            "update_async_task",
+            "cancel_async_task",
+            "list_async_tasks",
+        )
 
     def _subagent_args(tool_name: str, args) -> tuple[str, str]:
-        """Normalize custom and DeepAgents native subagent tool arguments."""
+        """Normalize async subagent tool arguments."""
         if not isinstance(args, dict):
             return "general", str(args)
-        if tool_name == "task":
-            return (
-                args.get("subagent_type", "general"),
-                args.get("description", "") or str(args),
-            )
         return (
-            args.get("agent_type", "general"),
-            args.get("task_description", "") or str(args),
+            args.get("subagent_type", "general"),
+            args.get("description", "") or str(args),
         )
 
     def _evt(icon: str, text: str, css: str = "", refresh: bool = True) -> None:
@@ -708,19 +741,45 @@ def _stream_response(
             "id": f"local_{idx}",
             "type": agent_type,
             "status": "running",
+            "last_action": "launch",
             "elapsed": "",
             "query": description,
+            "task_id": "",
+            "run_id": "",
             "model": "",
             "started_at": time.time(),
         })
         print(
-            "[CodingAgent Mermaid] spawn_subagent",
+            "[CodingAgent Mermaid] spawn_async_subagent",
             idx,
             agent_type,
             description[:120],
             flush=True,
         )
         return idx
+
+    def _set_task_identity(idx: int | None, task_id: str = "", run_id: str = "") -> None:
+        if idx is None or idx < 0 or idx >= len(tracked_agents):
+            return
+        if task_id:
+            tracked_agents[idx]["task_id"] = task_id
+        if run_id:
+            tracked_agents[idx]["run_id"] = run_id
+
+    def _set_task_action(idx: int | None, action: str, query: str | None = None) -> None:
+        if idx is None or idx < 0 or idx >= len(tracked_agents):
+            return
+        tracked_agents[idx]["last_action"] = action
+        if query:
+            tracked_agents[idx]["query"] = query
+
+    def _find_tracked_by_task_id(task_id: str) -> int | None:
+        if not task_id:
+            return None
+        for idx, agent_row in enumerate(tracked_agents):
+            if agent_row.get("task_id") == task_id:
+                return idx
+        return None
 
     def _track_complete(
         agent_type: str,
@@ -744,12 +803,13 @@ def _stream_response(
         success: bool = True,
         model: str = "",
         result_summary: str = "",
+        status: str | None = None,
     ) -> bool:
         if idx is None or idx < 0 or idx >= len(tracked_agents):
             return False
 
         agent = tracked_agents[idx]
-        agent["status"] = "completed" if success else "failed"
+        agent["status"] = status or ("completed" if success else "failed")
         agent["elapsed"] = f"{time.time() - agent['started_at']:.1f}"
         if model:
             agent["model"] = model
@@ -765,11 +825,52 @@ def _stream_response(
         )
         return True
 
+    def _parse_task_id(text: str) -> str:
+        match = re.search(r"task_id:\s*([a-f0-9-]{8,})", text, flags=re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    def _parse_check_payload(text: str) -> dict[str, str]:
+        payload = text.strip()
+        if not payload.startswith("{"):
+            return {}
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return {}
+        parsed = {
+            "status": str(data.get("status", "")),
+            "thread_id": str(data.get("thread_id", "")),
+            "result": str(data.get("result", "")),
+            "error": str(data.get("error", "")),
+        }
+        return parsed
+
+    def _apply_list_async_tasks(text: str) -> None:
+        for line in text.splitlines():
+            if "task_id:" not in line:
+                continue
+            task_id_match = re.search(r"task_id:\s*([a-f0-9-]{8,})", line, flags=re.IGNORECASE)
+            status_match = re.search(r"status:\s*([a-z_]+)", line, flags=re.IGNORECASE)
+            if not task_id_match:
+                continue
+            idx = _find_tracked_by_task_id(task_id_match.group(1))
+            if idx is None:
+                continue
+            if status_match:
+                status = status_match.group(1).lower()
+                if status == "success":
+                    tracked_agents[idx]["status"] = "completed"
+                elif status == "cancelled":
+                    tracked_agents[idx]["status"] = "cancelled"
+                elif status == "error":
+                    tracked_agents[idx]["status"] = "failed"
+                else:
+                    tracked_agents[idx]["status"] = "running"
+
     def _agents_state() -> list[dict]:
         """Return locally tracked SubAgents for THIS query only.
 
-        Does NOT fall back to registry (which is session-global) to avoid
-        mixing SubAgent history from previous queries into this Mermaid graph.
+        Avoids mixing prior-query async task state into this Mermaid graph.
         """
         return list(tracked_agents)
 
@@ -802,7 +903,7 @@ def _stream_response(
                     tools_used.append({
                         "name": tname,
                         "result": str(msg.content)[:200] if msg.content else "",
-                        "is_subagent": _is_subagent_tool(tname) or tname == "list_subagents",
+                        "is_subagent": _is_subagent_tool(tname),
                     })
                     _evt("🔧", f"Tool <b>{tname}</b> executed", "tool")
 
@@ -838,6 +939,7 @@ def _stream_response(
                 "mermaid_tooltips": inv_tips,
                 "mermaid_events": list(events),
                 "num_agents": len(inv_agents),
+                "async_task_snapshot": _capture_async_tasks(),
             })
             return True
 
@@ -948,7 +1050,7 @@ def _stream_response(
                             for tc in tool_calls:
                                 name = _tool_call_value(tc, "name", "unknown")
                                 args = _tool_call_value(tc, "args", {}) or {}
-                                if _is_subagent_tool(name):
+                                if _is_subagent_spawn_tool(name):
                                     atype, full_desc = _subagent_args(name, args)
                                     desc = _escape_html(full_desc[:60])
                                     # Track locally so Mermaid shows it immediately
@@ -956,13 +1058,46 @@ def _stream_response(
                                     tool_call_id = _tool_call_value(tc, "id")
                                     if tool_call_id:
                                         tool_call_agents[str(tool_call_id)] = tracked_idx
+                                        tool_call_actions[str(tool_call_id)] = "launch"
                                     _evt(
                                         AGENT_ICONS.get(atype, "🤖"),
-                                        f"Spawning <b>{atype}</b> SubAgent via <b>{name}</b>: {desc}",
+                                        f"Launching <b>{atype}</b> async task: {desc}",
                                         "subagent",
                                     )
-                                elif name == "list_subagents":
-                                    _evt("📋", "Listing SubAgents status", "subagent")
+                                elif name == "list_async_tasks":
+                                    _evt("📋", "Listing async task status", "subagent")
+                                elif name == "check_async_task":
+                                    task_id = _escape_html(str(args.get("task_id", ""))[:24])
+                                    raw_task_id = str(args.get("task_id", ""))
+                                    tool_call_id = _tool_call_value(tc, "id")
+                                    if tool_call_id:
+                                        idx = _find_tracked_by_task_id(raw_task_id)
+                                        if idx is not None:
+                                            tool_call_agents[str(tool_call_id)] = idx
+                                        tool_call_actions[str(tool_call_id)] = "check"
+                                    _evt("📡", f"Checking async task <b>{task_id}</b>", "subagent")
+                                elif name == "update_async_task":
+                                    task_id = _escape_html(str(args.get("task_id", ""))[:24])
+                                    raw_task_id = str(args.get("task_id", ""))
+                                    raw_message = str(args.get("message", "") or "")
+                                    tool_call_id = _tool_call_value(tc, "id")
+                                    if tool_call_id:
+                                        idx = _find_tracked_by_task_id(raw_task_id)
+                                        if idx is not None:
+                                            tool_call_agents[str(tool_call_id)] = idx
+                                            _set_task_action(idx, "update", query=raw_message[:300])
+                                        tool_call_actions[str(tool_call_id)] = "update"
+                                    _evt("✏️", f"Updating async task <b>{task_id}</b>", "subagent")
+                                elif name == "cancel_async_task":
+                                    task_id = _escape_html(str(args.get("task_id", ""))[:24])
+                                    raw_task_id = str(args.get("task_id", ""))
+                                    tool_call_id = _tool_call_value(tc, "id")
+                                    if tool_call_id:
+                                        idx = _find_tracked_by_task_id(raw_task_id)
+                                        if idx is not None:
+                                            tool_call_agents[str(tool_call_id)] = idx
+                                        tool_call_actions[str(tool_call_id)] = "cancel"
+                                    _evt("🛑", f"Cancelling async task <b>{task_id}</b>", "subagent")
                                 elif "memory_store" in name:
                                     cat = args.get("category", "?")
                                     _evt("🧠", f"Storing memory → <b>{cat}</b>", "memory")
@@ -1000,70 +1135,109 @@ def _stream_response(
                         tool_name = getattr(msg, "name", "unknown")
                         tool_call_id = getattr(msg, "tool_call_id", None)
                         tracked_idx = tool_call_agents.get(str(tool_call_id)) if tool_call_id else None
+                        action = tool_call_actions.get(str(tool_call_id), "")
                         tool_content_full = str(msg.content) if msg.content else ""
                         tool_content = tool_content_full[:300]
-                        is_sa = _is_subagent_tool(tool_name) or tool_name == "list_subagents"
+                        is_sa = _is_subagent_tool(tool_name)
                         tools_used.append({
                             "name": tool_name,
                             "result": tool_content,
                             "is_subagent": is_sa,
                         })
 
-                        if _is_subagent_tool(tool_name):
-                            # Extract info from registry history for model/elapsed
-                            model_label = ""
+                        if _is_subagent_spawn_tool(tool_name):
                             if tracked_idx is None:
                                 tracked_idx = _track_spawn("general", f"{tool_name} result")
                             sa_type = (
                                 tracked_agents[tracked_idx]["type"]
                                 if tracked_idx is not None and tracked_idx < len(tracked_agents)
-                                else ""
+                                else "general"
                             )
-                            sa_elapsed = ""
                             sa_model_short = ""
-                            try:
-                                for t in reversed(sa_mw.registry.history):
-                                    if not sa_type:
-                                        sa_type = getattr(t, "agent_type", "")
-                                    if hasattr(t, "model_used") and t.model_used:
-                                        sa_model_short = t.model_used.split("/")[-1][:20]
-                                        model_label = f" · 🧠 <b>{sa_model_short}</b>"
-                                    if hasattr(t, "completed_at") and hasattr(t, "created_at"):
-                                        if t.completed_at and t.created_at:
-                                            sa_elapsed = f" · {t.completed_at - t.created_at:.1f}s"
-                                    break
-                            except Exception:
-                                pass
 
                             # Extract raw result from tool output (no truncation)
                             _result_raw = ""
-                            if "Result:" in tool_content_full:
-                                _ri = tool_content_full.index("Result:") + 7
-                                _result_raw = tool_content_full[_ri:].strip()
-                            elif tool_content_full.strip():
+                            task_id = _parse_task_id(tool_content_full)
+                            if task_id:
+                                _set_task_identity(tracked_idx, task_id=task_id)
+                            if tool_content_full.strip():
                                 _result_raw = tool_content_full.strip()
 
-                            if "Result:" in tool_content_full or "result" in tool_content_full.lower()[:30]:
-                                if not _track_complete_by_index(tracked_idx, success=True, model=sa_model_short, result_summary=_result_raw):
-                                    _track_complete(sa_type or "general", success=True, model=sa_model_short, result_summary=_result_raw)
-                                icon = AGENT_ICONS.get(sa_type, "✅")
-                                result_preview = _escape_html(tool_content[:80])
-                                _evt(icon, f"SubAgent <b>{sa_type}</b> completed{sa_elapsed}{model_label}: {result_preview}", "done")
+                            if tool_name == "start_async_task" and task_id:
+                                _evt(
+                                    AGENT_ICONS.get(sa_type, "🤖"),
+                                    f"Async SubAgent <b>{sa_type}</b> launched with task_id <b>{task_id[:12]}...</b>",
+                                    "subagent",
+                                )
+                                _set_task_action(tracked_idx, "launch")
                             elif "failed" in tool_content_full.lower():
-                                if not _track_complete_by_index(tracked_idx, success=False, model=sa_model_short, result_summary=_result_raw):
-                                    _track_complete(sa_type or "general", success=False, model=sa_model_short, result_summary=_result_raw)
+                                if not _track_complete_by_index(
+                                    tracked_idx,
+                                    success=False,
+                                    model=sa_model_short,
+                                    result_summary=_result_raw,
+                                ):
+                                    _track_complete(sa_type, success=False, model=sa_model_short, result_summary=_result_raw)
                                 err_preview = _escape_html(tool_content[:80])
                                 _evt("❌", f"SubAgent failed: {err_preview}", "error")
                             else:
-                                if not _track_complete_by_index(tracked_idx, success=True, model=sa_model_short, result_summary=_result_raw):
-                                    _track_complete(sa_type or "general", success=True, model=sa_model_short, result_summary=_result_raw)
                                 _evt("🔄", f"SubAgent returned: {_escape_html(tool_content[:60])}", "subagent")
                             # SubAgent 상태 변경 → Mermaid 즉시 갱신
                             _refresh(True)
 
-                        elif tool_name == "list_subagents":
-                            count = tool_content.count("[")
-                            _evt("📋", f"SubAgent list returned ({count} entries)", "subagent")
+                        elif tool_name == "check_async_task":
+                            payload = _parse_check_payload(tool_content_full)
+                            idx = _find_tracked_by_task_id(payload.get("thread_id", ""))
+                            if idx is None and tracked_idx is not None:
+                                idx = tracked_idx
+                            status = payload.get("status", "").lower()
+                            if status == "success":
+                                summary = payload.get("result", "")
+                                _track_complete_by_index(idx, success=True, result_summary=summary, status="completed")
+                                _set_task_action(idx, "check")
+                                _evt("✅", f"Async task completed: {_escape_html(summary[:80])}", "done")
+                            elif status == "cancelled":
+                                summary = payload.get("error", "") or status
+                                _track_complete_by_index(idx, success=False, result_summary=summary, status="cancelled")
+                                _set_task_action(idx, "cancel")
+                                _evt("🛑", f"Async task cancelled: {_escape_html(summary[:80])}", "error")
+                            elif status == "error":
+                                summary = payload.get("error", "") or status
+                                _track_complete_by_index(idx, success=False, result_summary=summary, status="failed")
+                                _set_task_action(idx, "check")
+                                _evt("❌", f"Async task {status}: {_escape_html(summary[:80])}", "error")
+                            else:
+                                _set_task_action(idx, "check")
+                                _evt("📡", f"Async task still {status or 'running'}", "subagent")
+                            _refresh(True)
+
+                        elif tool_name == "update_async_task":
+                            task_id = _parse_task_id(tool_content_full)
+                            idx = _find_tracked_by_task_id(task_id)
+                            if idx is None and tracked_idx is not None:
+                                idx = tracked_idx
+                            if idx is not None:
+                                tracked_agents[idx]["status"] = "running"
+                                _set_task_action(idx, "update")
+                            _evt("✏️", f"Async task updated: {_escape_html((task_id or tool_content)[:80])}", "subagent")
+                            _refresh(True)
+
+                        elif tool_name == "cancel_async_task":
+                            task_id = _parse_task_id(tool_content_full)
+                            idx = _find_tracked_by_task_id(task_id)
+                            if idx is None and tracked_idx is not None:
+                                idx = tracked_idx
+                            _track_complete_by_index(idx, success=False, result_summary="cancelled", status="cancelled")
+                            _set_task_action(idx, "cancel")
+                            _evt("🛑", f"Async task cancelled: {_escape_html((task_id or tool_content)[:80])}", "error")
+                            _refresh(True)
+
+                        elif tool_name == "list_async_tasks":
+                            _apply_list_async_tasks(tool_content_full)
+                            count = tool_content_full.count("task_id:")
+                            if tracked_idx is not None:
+                                _set_task_action(tracked_idx, action or "list")
+                            _evt("📋", f"Async task list returned ({count} entries)", "subagent")
                             _refresh(True)
 
                         elif "memory_store" in tool_name:
@@ -1144,6 +1318,7 @@ def _stream_response(
             "mermaid_tooltips": err_tips,
             "mermaid_events": list(events),
             "num_agents": len(err_agents),
+            "async_task_snapshot": _capture_async_tasks(),
         })
         return True
 
@@ -1172,8 +1347,6 @@ def render_chat() -> None:
     if not comp:
         st.warning("Agent not initialized.")
         return
-
-    sa_mw = comp["subagent_middleware"]
 
     # ── Session state defaults ────────────────────────────
     for k, v in [
@@ -1333,6 +1506,15 @@ def render_chat() -> None:
                     with analysis_col:
                         with st.expander("🔍 Agent 동작 분석", expanded=_is_latest_assistant):
                             st.iframe(_hist_html, height=_h)
+                            _snap = msg.get("async_task_snapshot") or []
+                            if _snap:
+                                st.caption(f"Tracked async tasks at completion: {len(_snap)}")
+                                for _task in _snap[:4]:
+                                    st.caption(
+                                        f"- {_task.get('task_id', '')[:12]}... "
+                                        f"{_task.get('agent_type', 'unknown')} "
+                                        f"[{_task.get('status', 'unknown')}]"
+                                    )
 
                 st.markdown(
                     f"<div class='user-bubble-label'>👤 User</div>"
@@ -1446,7 +1628,7 @@ def render_chat() -> None:
         st.session_state["_is_running"] = True
         completed = False
         try:
-            completed = _stream_response(pending, graph_ph, result_ph_ref["ph"], sa_mw)
+            completed = _stream_response(pending, graph_ph, result_ph_ref["ph"])
         finally:
             st.session_state["_is_running"] = False
             st.session_state["_has_result"] = completed

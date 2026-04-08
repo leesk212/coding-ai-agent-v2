@@ -120,6 +120,26 @@ def render_settings() -> None:
         )
         settings.max_subagents = max_sa
 
+    st.markdown("---")
+    st.subheader("🛰️ Async SubAgent Runtime")
+
+    host = st.text_input(
+        "Async SubAgent Host",
+        value=settings.async_subagent_host,
+        help="Host interface used by local async subagent Agent Protocol servers.",
+    )
+    if host != settings.async_subagent_host:
+        settings.async_subagent_host = host
+
+    base_port = st.number_input(
+        "Async SubAgent Base Port",
+        min_value=1024,
+        max_value=65000,
+        value=settings.async_subagent_base_port,
+        help="The first port used for local async subagent processes. Each agent type increments from here.",
+    )
+    settings.async_subagent_base_port = int(base_port)
+
     col1, col2 = st.columns(2)
     with col1:
         timeout = st.number_input(

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
@@ -98,7 +99,7 @@ def create_model(spec: ModelSpec) -> BaseChatModel:
         raise ValueError(f"Unknown provider: {spec.provider}")
 
 
-class ModelFallbackMiddleware:
+class ModelFallbackMiddleware(AgentMiddleware):
     """Middleware that wraps LLM calls with automatic model fallback.
 
     Implements the DeepAgents AgentMiddleware interface pattern:

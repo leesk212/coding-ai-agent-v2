@@ -81,6 +81,12 @@ class Settings:
     max_subagents: int = field(
         default_factory=lambda: int(os.getenv("MAX_SUBAGENTS", "3"))
     )
+    async_subagent_host: str = field(
+        default_factory=lambda: os.getenv("ASYNC_SUBAGENT_HOST", "127.0.0.1")
+    )
+    async_subagent_base_port: int = field(
+        default_factory=lambda: int(os.getenv("ASYNC_SUBAGENT_BASE_PORT", "30240"))
+    )
 
     # Agentic loop
     max_iterations: int = 25

@@ -117,14 +117,24 @@ async def run_agent_loop(agent_components: dict) -> None:
 
         if user_input.lower() == "/subagents":
             sa_mw = agent_components["subagent_middleware"]
-            tasks = sa_mw.registry.get_all_tasks()
-            if tasks:
-                for t in tasks[:10]:
+            proc_rows = sa_mw.get_all_tasks()
+            if proc_rows:
+                console.print("[bold]Processes[/bold]")
+                for t in proc_rows[:10]:
                     console.print(
                         f"  [{t['id']}] {t['status']} ({t['agent_type']}): "
                         f"{t['task_description'][:60]}"
                     )
-            else:
+            tracker = agent_components.get("async_task_tracker")
+            task_rows = tracker.get_tasks("cli-session") if tracker else []
+            if task_rows:
+                console.print("[bold]Tracked Tasks[/bold]")
+                for t in task_rows[:10]:
+                    console.print(
+                        f"  [{t['task_id']}] {t['status']} ({t['agent_type']}) "
+                        f"run={t['run_id'][:12]}"
+                    )
+            if not proc_rows and not task_rows:
                 console.print("  (no sub-agents)")
             continue
 
@@ -222,6 +232,8 @@ def main() -> None:
         from coding_agent.agent import create_coding_agent
 
         components = create_coding_agent()
+        with console.status("[bold cyan]Starting local async subagents...[/bold cyan]"):
+            components["subagent_manager"].ensure_all_started()
     except Exception as e:
         console.print(f"[red]Failed to initialize agent: {e}[/red]")
         logger.exception("Init failed")

@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.tools import tool
 
 from coding_agent.memory.categories import MemoryCategory
@@ -51,7 +52,7 @@ You have access to a long-term vector memory system. Use it to:
 """
 
 
-class LongTermMemoryMiddleware:
+class LongTermMemoryMiddleware(AgentMiddleware):
     """Manages long-term memory via ChromaDB.
 
     Implements the DeepAgents middleware pattern:
