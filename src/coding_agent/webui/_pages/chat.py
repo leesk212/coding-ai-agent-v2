@@ -92,7 +92,8 @@ def _esc(text: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     # Mermaid may call window.btoa() internally, which fails on non-Latin1 text.
     # Keep the diagram source ASCII-only; full text remains available elsewhere.
-    return t.encode("ascii", "ignore").decode("ascii")
+    t = t.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def _escape_html(text: str) -> str:
@@ -198,7 +199,8 @@ def _build_mermaid(
 
     # ── Main Agent → User (완료 시) ──────────────────────
     if has_result:
-        lines.append('    M ==>|"Response"| U')
+        response_label = _edge_label(result_text, "response", limit=32)
+        lines.append(f'    M ==>|"{response_label}"| U')
 
     # ── Styles ────────────────────────────────────────────
     lines.append(
@@ -231,12 +233,24 @@ def _build_mermaid(
         s = _STATUS_STYLE.get(a["status"], _STATUS_STYLE["pending"])
         lines.append(f"    style S{i} {s}")
 
+    # Only the currently active nodes should pulse. Completed nodes stay static.
+    lines.append("    classDef activeNode stroke-width:3px")
+    active_nodes: list[str] = []
+    if is_working and not has_result:
+        active_nodes.append("M")
+    active_nodes.extend(f"S{i}" for i, a in enumerate(agents) if a["status"] == "running")
+    if active_nodes:
+        lines.append(f"    class {','.join(active_nodes)} activeNode")
+
     # Build tooltip map: truncated edge-label text → full text
     # JS looks up edge labels by their displayed text, not node IDs
     tooltips: dict[str, str] = {}
     if prompt_text:
         safe_p = _edge_label(prompt_text, "user prompt", limit=24)
         tooltips[safe_p] = prompt_text
+    if result_text:
+        response_label = _edge_label(result_text, "response", limit=32)
+        tooltips[response_label] = result_text
     for i, a in enumerate(agents):
         prompt_label = _edge_label(a.get("query", ""), f"{a['type']} task")
         if a.get("query"):
@@ -244,7 +258,7 @@ def _build_mermaid(
 
         if a.get("result_summary"):
             result_label = _edge_label(a.get("result_summary", ""), "result")
-            tooltips[result_label] = a["result_summary"][:500]
+            tooltips[result_label] = a["result_summary"]
 
     return "\n".join(lines), tooltips
 
@@ -291,20 +305,16 @@ def _build_page_html(
         ensure_ascii=True,
     )
 
-    # Optional CSS pulse for "working" state
+    # Optional CSS pulse for currently active nodes only.
     pulse_css = """
-    @keyframes pulse {
-        0%,100% { filter: drop-shadow(0 0 2px rgba(22,163,74,.15)); }
-        50%     { filter: drop-shadow(0 0 14px rgba(22,163,74,.45)); }
+    @keyframes active-node-pulse {
+        0%,100% { filter: drop-shadow(0 0 2px rgba(22,163,74,.20)); }
+        50%     { filter: drop-shadow(0 0 16px rgba(22,163,74,.75)); }
     }
-    @keyframes flow {
-        from { stroke-dashoffset: 12; }
-        to   { stroke-dashoffset: 0; }
-    }
-    .mermaid svg { animation: pulse 1.8s ease-in-out infinite; }
-    .mermaid .edgePaths path {
-        stroke-dasharray: 6 6;
-        animation: flow 1s linear infinite;
+    .mermaid .activeNode rect,
+    .mermaid .activeNode path,
+    .mermaid .activeNode polygon {
+        animation: active-node-pulse 1.35s ease-in-out infinite;
     }
     """ if is_working else ""
 
@@ -341,6 +351,10 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 .mermaid-error pre{{margin-top:6px;max-height:180px;overflow:auto;
   color:#7f1d1d;background:#fff1f2;border:1px solid #fecdd3;border-radius:6px;
   padding:8px;font-size:10px;white-space:pre-wrap}}
+.edge-tooltip{{position:fixed;display:none;z-index:9999;max-width:min(760px,92vw);
+  max-height:260px;overflow:auto;padding:10px 12px;border:1px solid #cbd5e1;
+  border-radius:10px;background:#0f172a;color:#f8fafc;box-shadow:0 12px 32px rgba(15,23,42,.22);
+  font-size:11px;line-height:1.45;text-align:left;white-space:pre-wrap;pointer-events:none}}
 </style>
 </head>
 <body>
@@ -349,6 +363,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 {mermaid_def}
 </pre>
 <div id="mermaid-error" class="mermaid-error"></div>
+<div id="edge-tooltip" class="edge-tooltip"></div>
 
 <div class="evts" id="ev">
   {events_html}
@@ -400,11 +415,29 @@ window.addEventListener("error", function(event) {{
   }}
 }});
 mermaid.run().then(function(){{
+  var tipBox = document.getElementById('edge-tooltip');
+  function moveTip(event) {{
+    if(!tipBox) return;
+    var x = Math.min(event.clientX + 14, window.innerWidth - tipBox.offsetWidth - 12);
+    var y = Math.min(event.clientY + 14, window.innerHeight - tipBox.offsetHeight - 12);
+    tipBox.style.left = Math.max(12, x) + 'px';
+    tipBox.style.top = Math.max(12, y) + 'px';
+  }}
   document.querySelectorAll('.edgeLabel span, .edgeLabel p, .edgeLabel div, .edgeLabel foreignObject span').forEach(function(el){{
     var txt = (el.textContent||'').trim();
     if(_tooltips[txt]){{
-      el.title = _tooltips[txt];
+      el.dataset.fullTooltip = _tooltips[txt];
       el.style.cursor = 'help';
+      el.addEventListener('mouseenter', function(event) {{
+        if(!tipBox) return;
+        tipBox.textContent = el.dataset.fullTooltip || '';
+        tipBox.style.display = 'block';
+        moveTip(event);
+      }});
+      el.addEventListener('mousemove', moveTip);
+      el.addEventListener('mouseleave', function() {{
+        if(tipBox) tipBox.style.display = 'none';
+      }});
     }}
   }});
 }}).catch(_showMermaidError);
