@@ -1068,9 +1068,9 @@ def render_chat() -> None:
 
     Layout:
       ┌──────────────────────────────────────────────────────┐
-      │  (idle) Danny's Agent 동작 분석기  (중앙 타이틀)     │
-      │  (active) 🔍 Agent 동작 분석                          │
-      │           🤖 Agent answer                             │
+      │  (idle) Danny's Coding AI Agent  (중앙 타이틀)       │
+      │  (active) 🤖 Agent answer                             │
+      │           🔍 Agent 동작 분석                          │
       │           👤 User prompt                              │
       ├──────────────────────────────────────────────────────┤
       │  📌 PROMPT 프리셋 버튼                                │
@@ -1182,7 +1182,7 @@ def render_chat() -> None:
         st.markdown(
             "<div style='text-align:center;padding:100px 20px 60px'>"
             "<h1 style='color:#1e293b;font-size:2em;margin-bottom:8px'>"
-            "Danny's Agent 동작 분석기</h1>"
+            "Danny's Coding AI Agent</h1>"
             "<p style='color:#94a3b8;font-size:1.05em'>"
             "메시지를 입력하거나 프롬프트를 클릭하세요</p>"
             "</div>",
@@ -1194,16 +1194,8 @@ def render_chat() -> None:
     else:
         # ── Active conversation: chat-style layout ────────
 
-        # Title (compact)
-        st.markdown(
-            "<p style='text-align:center;color:#94a3b8;font-size:.85em;"
-            "margin:0 0 12px;letter-spacing:.3px'>"
-            "Danny's Agent 동작 분석기</p>",
-            unsafe_allow_html=True,
-        )
-
         # Show previous conversation pairs (history within session)
-        # Layout: Mermaid analysis → Agent answer → User prompt.
+        # Layout: Agent answer → Mermaid analysis → User prompt.
         _last_user_content = ""
         _assistant_total = sum(
             1 for msg in st.session_state.chat_messages
@@ -1218,7 +1210,16 @@ def render_chat() -> None:
                 _assistant_idx += 1
                 _is_latest_assistant = _assistant_idx == _assistant_total
 
-                # ── Above: Agent 동작 분석 (full width) ───────
+                model_html = ""
+                if msg.get("model"):
+                    model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(msg['model'])}</div>"
+                safe_content = _escape_bubble_html(msg["content"])
+                st.markdown(
+                    f"<div class='agent-bubble-label'>🤖 Agent</div>"
+                    f"<div class='agent-bubble'>{safe_content}{model_html}</div>",
+                    unsafe_allow_html=True,
+                )
+
                 if msg.get("mermaid_def"):
                     _hist_html = _build_page_html(
                         msg["mermaid_def"],
@@ -1227,16 +1228,12 @@ def render_chat() -> None:
                         tooltips=msg.get("mermaid_tooltips", {}),
                     )
                     _h = max(350, 220 + msg.get("num_agents", 0) * 70)
-                    with st.expander("🔍 Agent 동작 분석", expanded=_is_latest_assistant):
-                        st.iframe(_hist_html, height=_h)
+                    analysis_col, _ = st.columns([23, 2])
+                    with analysis_col:
+                        with st.expander("🔍 Agent 동작 분석", expanded=_is_latest_assistant):
+                            st.iframe(_hist_html, height=_h)
 
-                model_html = ""
-                if msg.get("model"):
-                    model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(msg['model'])}</div>"
-                safe_content = _escape_bubble_html(msg["content"])
                 st.markdown(
-                    f"<div class='agent-bubble-label'>🤖 Agent</div>"
-                    f"<div class='agent-bubble'>{safe_content}{model_html}</div>"
                     f"<div class='user-bubble-label'>👤 User</div>"
                     f"<div class='user-bubble'>{_escape_bubble_html(_last_user_content)}</div>",
                     unsafe_allow_html=True,
@@ -1246,18 +1243,8 @@ def render_chat() -> None:
                             unsafe_allow_html=True)
 
         # ── Live interaction area (current pending/running) ──
-        # Layout: Mermaid analysis → Agent progress/answer → User prompt.
+        # Layout: Agent progress/answer → Mermaid analysis → User prompt.
         if pending or is_running:
-            # Agent 동작 분석을 먼저 렌더해서 답변 bubble보다 늦게 나타나는 느낌을 줄인다.
-            st.markdown(
-                "<p style='margin:10px 0 4px;font-size:.8em;font-weight:700;"
-                "color:#64748b;letter-spacing:.4px'>🔍 AGENT 동작 분석</p>",
-                unsafe_allow_html=True,
-            )
-            graph_ph = st.empty()
-            idle_def, tips = _build_mermaid([], True, pending or "")
-            _render_mermaid(graph_ph, idle_def, [], True, num_agents=0, tooltips=tips)
-
             st.markdown(
                 "<div class='agent-bubble-label'>🤖 Agent</div>",
                 unsafe_allow_html=True,
@@ -1270,6 +1257,18 @@ def render_chat() -> None:
                     "</div>",
                     unsafe_allow_html=True,
                 )
+
+            st.markdown(
+                "<p style='margin:10px 0 4px;font-size:.8em;font-weight:700;"
+                "color:#64748b;letter-spacing:.4px'>🔍 AGENT 동작 분석</p>",
+                unsafe_allow_html=True,
+            )
+            analysis_col, _ = st.columns([23, 2])
+            with analysis_col:
+                graph_ph = st.empty()
+                idle_def, tips = _build_mermaid([], True, pending or "")
+                _render_mermaid(graph_ph, idle_def, [], True, num_agents=0, tooltips=tips)
+
             prompt_display = pending or "(processing…)"
             st.markdown(
                 f"<div class='user-bubble-label'>👤 User</div>"
