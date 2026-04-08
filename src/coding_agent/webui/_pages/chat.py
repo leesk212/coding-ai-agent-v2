@@ -4,7 +4,7 @@ Back-end generates Mermaid syntax → front-end renders it dynamically via CDN.
 
 Layout (top → bottom):
 ┌──────────────────────────────────────────────────────────┐
-│  📝 질의 입력창 (text_area)  │ 🚀 Send │ 🔄 New Chat    │
+│  📝 질의 입력창 (text_area)  │ 🚀 Send / 🔄 Refresh    │
 ├──────────────────────────────────────────────────────────┤
 │  🔍 Agent 동작 분석                                       │
 │  ├─ 📊 Mermaid FlowChart  (graph LR)                     │
@@ -507,11 +507,11 @@ def _stream_response(
     graph_ph,
     result_ph,
     sa_mw,
-) -> None:
+) -> bool:
     """Stream agent response — update flowchart, event feed, and result."""
     comp = st.session_state.agent_components
     if not comp:
-        return
+        return False
 
     agent = comp["agent"]
     fallback_mw = comp["fallback_middleware"]
@@ -539,6 +539,9 @@ def _stream_response(
     tool_call_agents: dict[str, int] = {}
 
     # ── helpers ───────────────────────────────────────────
+
+    def _is_cancelled() -> bool:
+        return bool(st.session_state.get("_refresh_requested"))
 
     def _render_agent_status(text: str) -> None:
         """Show progress in the Agent bubble until actual model content arrives."""
@@ -719,7 +722,7 @@ def _stream_response(
                 "mermaid_events": list(events),
                 "num_agents": len(inv_agents),
             })
-            return
+            return True
 
         # ── Streaming mode ────────────────────────────────
 
@@ -727,8 +730,16 @@ def _stream_response(
         _evt("🔄", f"Streaming started (model: <b>{_escape_html(current_model or 'selecting…')}</b>)", "tool")
 
         for chunk in agent.stream(inputs, config=config, stream_mode="updates"):
+            if _is_cancelled():
+                _evt("🛑", "Refresh requested — stopping current run", "error", refresh=False)
+                return False
+
             step_count += 1
             for _node, node_output in chunk.items():
+                if _is_cancelled():
+                    _evt("🛑", "Refresh requested — stopping current run", "error", refresh=False)
+                    return False
+
                 # Unwrap LangGraph Overwrite wrapper if present
                 if not isinstance(node_output, dict):
                     node_output = getattr(node_output, "value", None) or {}
@@ -940,6 +951,7 @@ def _stream_response(
             "mermaid_events": list(events),
             "num_agents": len(final_agents),
         })
+        return True
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -963,6 +975,7 @@ def _stream_response(
             "mermaid_events": list(events),
             "num_agents": len(err_agents),
         })
+        return True
 
 
 # ─────────────────────────────────────────────────────────
@@ -979,7 +992,7 @@ def render_chat() -> None:
       │           💬 Result (full-width)                      │
       ├──────────────────────────────────────────────────────┤
       │  📌 PROMPT 프리셋 버튼                                │
-      │  📝 입력창  │ 🚀 Send │ 🔄 New Chat                  │
+      │  📝 입력창  │ 🚀 Send / 🔄 Refresh                  │
       └──────────────────────────────────────────────────────┘
     """
     comp = st.session_state.get("agent_components")
@@ -1077,7 +1090,6 @@ def render_chat() -> None:
 
     # ── Determine conversation state ─────────────────────
     has_conversation = bool(st.session_state.chat_messages) or pending or is_running
-    has_result = st.session_state.get("_has_result", False)
 
     # ── 1. Main content area ─────────────────────────────
     graph_ph = st.empty()
@@ -1223,8 +1235,8 @@ def render_chat() -> None:
                 st.session_state["_prompt_area"] = p
                 st.rerun()
 
-    # ── 질의 입력창 + Send + New Chat ────────────────────
-    input_col, send_col, new_col = st.columns([6, 1, 1])
+    # ── 질의 입력창 + Send/Refresh ───────────────────────
+    input_col, action_col = st.columns([6, 1])
     with input_col:
         # ★ 입력창: is_running일 때만 disabled (idle 상태에서는 항상 활성)
         user_input = st.text_area(
@@ -1235,7 +1247,7 @@ def render_chat() -> None:
             label_visibility="collapsed",
             placeholder="Ask me anything about coding…",
         )
-    with send_col:
+    with action_col:
         # ★ Send: 실행 중일 때만 비활성. 빈 입력은 클릭 후 안내로 처리한다.
         send_clicked = st.button(
             "🚀 Send",
@@ -1243,12 +1255,9 @@ def render_chat() -> None:
             disabled=is_running,
             type="primary",
         )
-    with new_col:
-        # ★ New Chat: 결과가 있고 실행 중이 아닐 때만 활성
-        new_chat_clicked = st.button(
-            "🔄 New Chat",
+        refresh_clicked = st.button(
+            "🔄 Refresh",
             use_container_width=True,
-            disabled=is_running or not has_result,
             type="secondary",
         )
     if send_clicked:
@@ -1258,7 +1267,10 @@ def render_chat() -> None:
             st.rerun()
         else:
             st.info("메시지를 입력한 뒤 Send를 눌러주세요.")
-    if new_chat_clicked:
+    if refresh_clicked:
+        st.session_state["_refresh_requested"] = True
+        st.session_state["_is_running"] = False
+        st.session_state.pop("_pending_prompt", None)
         st.session_state["_has_result"] = False
         st.session_state["chat_messages"] = []
         st.session_state["_clear_prompt"] = True
@@ -1266,11 +1278,13 @@ def render_chat() -> None:
 
     # ── Pending prompt 실행 ───────────────────────────────
     if pending:
+        st.session_state["_refresh_requested"] = False
         st.session_state["_is_running"] = True
+        completed = False
         try:
-            _stream_response(pending, graph_ph, result_ph_ref["ph"], sa_mw)
+            completed = _stream_response(pending, graph_ph, result_ph_ref["ph"], sa_mw)
         finally:
             st.session_state["_is_running"] = False
-            st.session_state["_has_result"] = True
+            st.session_state["_has_result"] = completed
             # ★ 실행 완료 후 rerun → 입력창 활성화 + New Chat 활성화
             st.rerun()
