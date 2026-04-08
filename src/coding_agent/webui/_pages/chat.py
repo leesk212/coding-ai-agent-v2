@@ -369,9 +369,19 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
   color:#7f1d1d;background:#fff1f2;border:1px solid #fecdd3;border-radius:6px;
   padding:8px;font-size:10px;white-space:pre-wrap}}
 .edge-tooltip{{position:fixed;display:none;z-index:9999;max-width:min(760px,92vw);
-  max-height:260px;overflow:auto;padding:10px 12px;border:1px solid #cbd5e1;
+  max-height:260px;min-width:min(340px,72vw);padding:0;border:1px solid #cbd5e1;
   border-radius:10px;background:#0f172a;color:#f8fafc;box-shadow:0 12px 32px rgba(15,23,42,.22);
-  font-size:11px;line-height:1.45;text-align:left;white-space:pre-wrap;pointer-events:none}}
+  font-size:11px;line-height:1.45;text-align:left;pointer-events:auto;overflow:hidden}}
+.edge-tooltip-content{{max-height:228px;overflow-y:auto;padding:10px 12px 8px;
+  white-space:pre-wrap}}
+.edge-tooltip-hint{{display:none;padding:6px 12px;border-top:1px solid rgba(203,213,225,.18);
+  background:linear-gradient(180deg, rgba(15,23,42,.88), rgba(15,23,42,1));
+  color:#cbd5e1;font-size:10px;letter-spacing:.2px}}
+.edge-tooltip.scrollable .edge-tooltip-hint{{display:block}}
+.edge-tooltip-content::-webkit-scrollbar{{width:10px}}
+.edge-tooltip-content::-webkit-scrollbar-track{{background:rgba(148,163,184,.12);border-radius:999px}}
+.edge-tooltip-content::-webkit-scrollbar-thumb{{background:rgba(148,163,184,.55);border-radius:999px}}
+.edge-tooltip-content{{scrollbar-width:thin;scrollbar-color:rgba(148,163,184,.55) rgba(148,163,184,.12)}}
 </style>
 </head>
 <body>
@@ -380,7 +390,10 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 {mermaid_def}
 </pre>
 <div id="mermaid-error" class="mermaid-error"></div>
-<div id="edge-tooltip" class="edge-tooltip"></div>
+<div id="edge-tooltip" class="edge-tooltip">
+  <div id="edge-tooltip-content" class="edge-tooltip-content"></div>
+  <div id="edge-tooltip-hint" class="edge-tooltip-hint">Scroll for more</div>
+</div>
 
 <div class="evts" id="ev">
   {events_html}
@@ -433,12 +446,46 @@ window.addEventListener("error", function(event) {{
 }});
 mermaid.run().then(function(){{
   var tipBox = document.getElementById('edge-tooltip');
+  var tipContent = document.getElementById('edge-tooltip-content');
+  var hideTimer = null;
+  var tooltipPinned = false;
+  function cancelHide() {{
+    if(hideTimer) {{
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }}
+  }}
+  function scheduleHide() {{
+    cancelHide();
+    hideTimer = setTimeout(function() {{
+      if(tipBox) {{
+        tipBox.style.display = 'none';
+        tipBox.classList.remove('scrollable');
+      }}
+      tooltipPinned = false;
+    }}, 120);
+  }}
+  function updateScrollableHint() {{
+    if(!tipBox || !tipContent) return;
+    var scrollable = tipContent.scrollHeight > tipContent.clientHeight + 4;
+    tipBox.classList.toggle('scrollable', scrollable);
+  }}
   function moveTip(event) {{
     if(!tipBox) return;
     var x = Math.min(event.clientX + 14, window.innerWidth - tipBox.offsetWidth - 12);
     var y = Math.min(event.clientY + 14, window.innerHeight - tipBox.offsetHeight - 12);
     tipBox.style.left = Math.max(12, x) + 'px';
     tipBox.style.top = Math.max(12, y) + 'px';
+  }}
+  if(tipBox) {{
+    tipBox.addEventListener('mouseenter', function() {{
+      tooltipPinned = true;
+      cancelHide();
+    }});
+    tipBox.addEventListener('mouseleave', function() {{
+      tooltipPinned = false;
+      scheduleHide();
+    }});
   }}
   document.querySelectorAll('.edgeLabel span, .edgeLabel p, .edgeLabel div, .edgeLabel foreignObject span').forEach(function(el){{
     var txt = (el.textContent||'').trim();
@@ -447,13 +494,20 @@ mermaid.run().then(function(){{
       el.style.cursor = 'help';
       el.addEventListener('mouseenter', function(event) {{
         if(!tipBox) return;
-        tipBox.textContent = el.dataset.fullTooltip || '';
+        cancelHide();
+        if(tipContent) {{
+          tipContent.textContent = el.dataset.fullTooltip || '';
+          tipContent.scrollTop = 0;
+        }}
         tipBox.style.display = 'block';
         moveTip(event);
+        updateScrollableHint();
       }});
-      el.addEventListener('mousemove', moveTip);
+      el.addEventListener('mousemove', function(event) {{
+        if(!tooltipPinned) moveTip(event);
+      }});
       el.addEventListener('mouseleave', function() {{
-        if(tipBox) tipBox.style.display = 'none';
+        scheduleHide();
       }});
     }}
   }});
