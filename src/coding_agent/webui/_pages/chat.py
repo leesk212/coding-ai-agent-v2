@@ -527,6 +527,7 @@ def _stream_response(
     inputs = {"messages": [HumanMessage(content=prompt)]}
 
     final_text = ""
+    streamed_text = ""
     current_model = ""
     tools_used: list[dict] = []
     events: list[dict] = []  # 질의별 독립 이벤트 리스트
@@ -553,6 +554,39 @@ def _stream_response(
             "</div>",
             unsafe_allow_html=True,
         )
+
+    def _render_agent_answer(text: str, model: str = "") -> None:
+        model_html = ""
+        if model:
+            model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(model)}</div>"
+        result_ph.markdown(
+            f"<div class='agent-bubble'>{_escape_bubble_html(text)}{model_html}</div>",
+            unsafe_allow_html=True,
+        )
+
+    def _message_text_delta(message, metadata) -> str:
+        """Extract user-visible streamed text from a LangGraph messages chunk."""
+        if metadata and metadata.get("lc_source") == "summarization":
+            return ""
+
+        blocks = getattr(message, "content_blocks", None)
+        if blocks:
+            text_parts: list[str] = []
+            for block in blocks:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+            return "".join(text_parts)
+
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    text_parts.append(block.get("text", ""))
+            return "".join(text_parts)
+        return ""
 
     def _tool_call_value(tool_call, key: str, default=None):
         if isinstance(tool_call, dict):
@@ -729,10 +763,59 @@ def _stream_response(
         current_model = fallback_mw.current_model or ""
         _evt("🔄", f"Streaming started (model: <b>{_escape_html(current_model or 'selecting…')}</b>)", "tool")
 
-        for chunk in agent.stream(inputs, config=config, stream_mode="updates"):
+        try:
+            stream = agent.stream(
+                inputs,
+                config=config,
+                stream_mode=["messages", "updates"],
+                subgraphs=True,
+            )
+        except TypeError:
+            stream = agent.stream(
+                inputs,
+                config=config,
+                stream_mode=["messages", "updates"],
+            )
+
+        for raw_chunk in stream:
             if _is_cancelled():
                 _evt("🛑", "Refresh requested — stopping current run", "error", refresh=False)
                 return False
+
+            if isinstance(raw_chunk, tuple) and len(raw_chunk) == 3:
+                namespace, current_stream_mode, chunk_data = raw_chunk
+                is_main_agent = not namespace
+            elif isinstance(raw_chunk, tuple) and len(raw_chunk) == 2:
+                namespace = ()
+                current_stream_mode, chunk_data = raw_chunk
+                is_main_agent = True
+            else:
+                namespace = ()
+                current_stream_mode = "updates"
+                chunk_data = raw_chunk
+                is_main_agent = True
+
+            if current_stream_mode == "messages":
+                if not is_main_agent:
+                    continue
+                if not isinstance(chunk_data, tuple) or len(chunk_data) != 2:
+                    continue
+                message, metadata = chunk_data
+                msg_type = getattr(message, "type", None)
+                if msg_type == "AIMessageChunk" or "AIMessageChunk" in type(message).__name__ or msg_type == "ai":
+                    text_delta = _message_text_delta(message, metadata)
+                    if text_delta:
+                        streamed_text += text_delta
+                        final_text = streamed_text
+                        _render_agent_answer(streamed_text)
+                continue
+
+            if not is_main_agent:
+                continue
+
+            chunk = chunk_data
+            if not isinstance(chunk, dict):
+                continue
 
             step_count += 1
             for _node, node_output in chunk.items():
@@ -797,6 +880,7 @@ def _stream_response(
                         )
                         if content and not tool_calls:
                             final_text = content
+                            streamed_text = content
                             _evt(
                                 "💬",
                                 f"AI response received ({len(content):,} chars)",
@@ -804,12 +888,7 @@ def _stream_response(
                                 refresh=False,
                             )
                             _refresh(True, result=final_text, model=current_model)
-                            with result_ph:
-                                safe_final_text = _escape_bubble_html(final_text)
-                                st.markdown(
-                                    f"<div class='agent-bubble'>{safe_final_text}</div>",
-                                    unsafe_allow_html=True,
-                                )
+                            _render_agent_answer(final_text)
 
                     elif msg_type == "tool":
                         tool_name = getattr(msg, "name", "unknown")
@@ -908,6 +987,8 @@ def _stream_response(
                             if isinstance(msg.content, str)
                             else str(msg.content)
                         )
+                        if not streamed_text:
+                            streamed_text = final_text
                         break
             except Exception:
                 pass
@@ -1121,7 +1202,7 @@ def render_chat() -> None:
         )
 
         # Show previous conversation pairs (history within session)
-        # Layout: [💬 Result (left)] [👤 User (right)] → [🔍 Agent 동작 분석 (below)]
+        # Layout: Agent answer above its user prompt → Mermaid analysis below.
         _last_user_content = ""
         _assistant_total = sum(
             1 for msg in st.session_state.chat_messages
@@ -1136,26 +1217,17 @@ def render_chat() -> None:
                 _assistant_idx += 1
                 _is_latest_assistant = _assistant_idx == _assistant_total
 
-                # ── Row: Agent bubble (left) + User bubble (right) ──
-                agent_col, user_col = st.columns([3, 2])
-
-                with agent_col:
-                    model_html = ""
-                    if msg.get("model"):
-                        model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(msg['model'])}</div>"
-                    safe_content = _escape_bubble_html(msg["content"])
-                    st.markdown(
-                        f"<div class='agent-bubble-label'>🤖 Agent</div>"
-                        f"<div class='agent-bubble'>{safe_content}{model_html}</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                with user_col:
-                    st.markdown(
-                        f"<div class='user-bubble-label'>👤 User</div>"
-                        f"<div class='user-bubble'>{_escape_bubble_html(_last_user_content)}</div>",
-                        unsafe_allow_html=True,
-                    )
+                model_html = ""
+                if msg.get("model"):
+                    model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(msg['model'])}</div>"
+                safe_content = _escape_bubble_html(msg["content"])
+                st.markdown(
+                    f"<div class='agent-bubble-label'>🤖 Agent</div>"
+                    f"<div class='agent-bubble'>{safe_content}{model_html}</div>"
+                    f"<div class='user-bubble-label'>👤 User</div>"
+                    f"<div class='user-bubble'>{_escape_bubble_html(_last_user_content)}</div>",
+                    unsafe_allow_html=True,
+                )
 
                 # ── Below: Agent 동작 분석 (full width) ───────
                 if msg.get("mermaid_def"):
@@ -1173,7 +1245,7 @@ def render_chat() -> None:
                             unsafe_allow_html=True)
 
         # ── Live interaction area (current pending/running) ──
-        # Layout: [💬 Result (left)] [👤 User (right)] → [🔍 Agent 동작 분석 (below)]
+        # Layout: Mermaid analysis → Agent progress/answer → User prompt.
         if pending or is_running:
             # Agent 동작 분석을 먼저 렌더해서 답변 bubble보다 늦게 나타나는 느낌을 줄인다.
             st.markdown(
@@ -1185,29 +1257,24 @@ def render_chat() -> None:
             idle_def, tips = _build_mermaid([], True, pending or "")
             _render_mermaid(graph_ph, idle_def, [], True, num_agents=0, tooltips=tips)
 
-            agent_col, user_col = st.columns([3, 2])
-
-            with user_col:
-                prompt_display = pending or "(processing…)"
-                st.markdown(
-                    f"<div class='user-bubble-label'>👤 User</div>"
-                    f"<div class='user-bubble'>{_escape_bubble_html(prompt_display)}</div>",
+            st.markdown(
+                "<div class='agent-bubble-label'>🤖 Agent</div>",
+                unsafe_allow_html=True,
+            )
+            result_ph_ref["ph"] = st.empty()
+            if pending or is_running:
+                result_ph_ref["ph"].markdown(
+                    "<div class='agent-bubble'>"
+                    "Thinking...<div class='agent-bubble-model'>Waiting for model output</div>"
+                    "</div>",
                     unsafe_allow_html=True,
                 )
-
-            with agent_col:
-                st.markdown(
-                    "<div class='agent-bubble-label'>🤖 Agent</div>",
-                    unsafe_allow_html=True,
-                )
-                result_ph_ref["ph"] = st.empty()
-                if pending or is_running:
-                    result_ph_ref["ph"].markdown(
-                        "<div class='agent-bubble'>"
-                        "Thinking...<div class='agent-bubble-model'>Waiting for model output</div>"
-                        "</div>",
-                        unsafe_allow_html=True,
-                    )
+            prompt_display = pending or "(processing…)"
+            st.markdown(
+                f"<div class='user-bubble-label'>👤 User</div>"
+                f"<div class='user-bubble'>{_escape_bubble_html(prompt_display)}</div>",
+                unsafe_allow_html=True,
+            )
         else:
             result_ph_ref["ph"] = st.empty()
 
