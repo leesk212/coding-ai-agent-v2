@@ -52,15 +52,9 @@ TEST_PROMPTS = {
 #  Mermaid helpers
 # ─────────────────────────────────────────────────────────
 
-def _esc(text: str) -> str:
-    """Sanitise *text* so it can be safely placed inside a Mermaid label
-    (both ``"node label"`` and ``|"edge label"|``).
-
-    Aggressively strips anything that could break Mermaid syntax.
-    Mermaid source is kept ASCII-only to avoid browser btoa() failures.
-    """
+def _clean_label_text(text: str) -> str:
+    """Sanitise *text* before it is placed inside a Mermaid label."""
     import re
-    # First pass: basic replacements
     t = (
         text
         .replace("\\", "")
@@ -88,12 +82,25 @@ def _esc(text: str) -> str:
         .replace("=>", " ")  # Mermaid edge syntax
         .replace(":", " ")   # Mermaid node description separator
     )
-    # Collapse multiple spaces
-    t = re.sub(r"\s+", " ", t).strip()
-    # Mermaid may call window.btoa() internally, which fails on non-Latin1 text.
-    # Keep the diagram source ASCII-only; full text remains available elsewhere.
-    t = t.encode("ascii", "ignore").decode("ascii")
     return re.sub(r"\s+", " ", t).strip()
+
+
+def _ascii_label(text: str) -> str:
+    """Encode non-ASCII chars as HTML entities while keeping source ASCII-only."""
+    return "".join(ch if ord(ch) < 128 else f"&#{ord(ch)};" for ch in text)
+
+
+def _esc(text: str) -> str:
+    """Sanitise *text* so it can be safely placed inside a Mermaid label
+    (both ``"node label"`` and ``|"edge label"|``).
+
+    Mermaid source is kept ASCII-only to avoid browser btoa() failures, but
+    non-ASCII preview text is preserved through HTML numeric entities.
+    """
+    t = _clean_label_text(text)
+    # Mermaid may call window.btoa() internally, which fails on non-Latin1 text.
+    # Keep the diagram source ASCII-only; browsers render entities as text.
+    return _ascii_label(t)
 
 
 def _escape_html(text: str) -> str:
@@ -124,12 +131,22 @@ def _escape_bubble_html(text: str) -> str:
 
 def _edge_label(text: str, fallback: str, limit: int = 28) -> str:
     """Return a short Mermaid-safe edge label."""
-    safe = _esc(text or "")
+    safe_text = _clean_label_text(text or "")
+    if not safe_text:
+        return fallback
+    if len(safe_text) > limit:
+        safe_text = safe_text[:limit].rstrip() + "..."
+    safe = _ascii_label(safe_text)
     if not safe:
         return fallback
-    if len(safe) > limit:
-        return safe[:limit].rstrip() + "..."
     return safe
+
+
+def _add_tooltip(tooltips: dict[str, str], label: str, full_text: str) -> None:
+    """Register tooltip by both raw entity label and rendered text label."""
+    import html as _html
+    tooltips[label] = full_text
+    tooltips[_html.unescape(label)] = full_text
 
 
 def _build_mermaid(
@@ -247,18 +264,18 @@ def _build_mermaid(
     tooltips: dict[str, str] = {}
     if prompt_text:
         safe_p = _edge_label(prompt_text, "user prompt", limit=24)
-        tooltips[safe_p] = prompt_text
+        _add_tooltip(tooltips, safe_p, prompt_text)
     if result_text:
         response_label = _edge_label(result_text, "response", limit=32)
-        tooltips[response_label] = result_text
+        _add_tooltip(tooltips, response_label, result_text)
     for i, a in enumerate(agents):
         prompt_label = _edge_label(a.get("query", ""), f"{a['type']} task")
         if a.get("query"):
-            tooltips[prompt_label] = a["query"]
+            _add_tooltip(tooltips, prompt_label, a["query"])
 
         if a.get("result_summary"):
             result_label = _edge_label(a.get("result_summary", ""), "result")
-            tooltips[result_label] = a["result_summary"]
+            _add_tooltip(tooltips, result_label, a["result_summary"])
 
     return "\n".join(lines), tooltips
 
