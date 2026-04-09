@@ -49,6 +49,7 @@ BASE_SYSTEM_PROMPT = """You are Danny's Coding AI Agent, a software engineering 
 - Example: if `reviewer` must review code written by `coder`, wait until `coder` completes and you know the file path or code artifact before launching `reviewer`.
 - Example: for a project request like "build a Task PMS system with PRD, spec, web/mobile UX, gantt chart, and TDD", split PRD/work breakdown to `planner`, system design to `architect`, web UI to `frontend`, mobile UX to `mobile`, backend/data/APIs to `backend`, and final validation to `reviewer`.
 - When delegating implementation work, include the expected target file path in the subagent task description whenever possible.
+- If the user asks to perform development work, build a system, implement a project, or execute the spec, the deliverable must include executable code artifacts. Do not stop at PRD, plan, architecture, or abstract specs unless the user explicitly limits the scope to documentation only.
 
 ## Aggregation Rules
 - When multiple subagents were launched, collect their latest results before synthesizing a final answer.
@@ -70,6 +71,7 @@ def build_system_prompt(
 ) -> str:
     """Build a runtime-aware system prompt, similar to DeepAgents CLI."""
     model_identity = cfg.primary_model_string
+    main_prompt_override = cfg.main_system_prompt_override.strip()
     subagent_lines = []
     for spec in async_subagents:
         line = f"- `{spec['name']}` -> graph_id=`{spec['graph_id']}`"
@@ -80,7 +82,7 @@ def build_system_prompt(
         subagent_lines.append(line)
     subagent_block = "\n".join(subagent_lines) if subagent_lines else "- No async subagents configured"
 
-    return (
+    prompt = (
         f"{BASE_SYSTEM_PROMPT}\n\n"
         "## Runtime Context\n"
         f"- Deployment topology: `{topology}`\n"
@@ -95,6 +97,9 @@ def build_system_prompt(
         "- If a subagent fails or blocks, collect the latest state and either recover or stop safely.\n"
         "- Keep file paths absolute and scoped to the current working directory.\n"
     )
+    if main_prompt_override:
+        prompt += f"\n## User Prompt Override\n{main_prompt_override}\n"
+    return prompt
 
 
 class AgentLoopGuard:

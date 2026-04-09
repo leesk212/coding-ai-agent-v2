@@ -6,6 +6,7 @@ fallback.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -117,6 +118,8 @@ class Settings:
     async_subagent_base_port: int = field(
         default_factory=lambda: int(os.getenv("ASYNC_SUBAGENT_BASE_PORT", "30240"))
     )
+    main_system_prompt_override: str = ""
+    subagent_system_prompt_overrides: dict[str, str] = field(default_factory=dict)
 
     # Agentic loop
     max_iterations: int = field(
@@ -155,6 +158,38 @@ class Settings:
         fallback_model = self.selected_fallback_model or self.local_fallback_model
         return fallback_model.to_model_string()
 
+    @property
+    def prompt_override_path(self) -> Path:
+        return self.state_dir / "prompt_overrides.json"
+
+    def load_prompt_overrides(self) -> None:
+        path = self.prompt_override_path
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        self.main_system_prompt_override = str(data.get("main_system_prompt_override", "") or "")
+        raw = data.get("subagent_system_prompt_overrides", {})
+        self.subagent_system_prompt_overrides = (
+            {str(k): str(v) for k, v in raw.items() if str(v).strip()}
+            if isinstance(raw, dict)
+            else {}
+        )
+
+    def save_prompt_overrides(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        data = {
+            "main_system_prompt_override": self.main_system_prompt_override,
+            "subagent_system_prompt_overrides": self.subagent_system_prompt_overrides,
+        }
+        self.prompt_override_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
 
 # Global settings instance
 settings = Settings()
+settings.load_prompt_overrides()

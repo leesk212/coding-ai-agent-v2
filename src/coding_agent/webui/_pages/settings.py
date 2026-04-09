@@ -3,6 +3,7 @@
 import os
 import streamlit as st
 
+from coding_agent.async_subagent_manager import get_default_subagent_system_prompts
 from coding_agent.config import ModelSpec, settings
 
 
@@ -123,6 +124,58 @@ def render_settings() -> None:
             st.error(f"Cannot connect to Ollama: {e}")
 
     st.markdown("---")
+    st.subheader("🧩 Agent System Prompts")
+    st.caption("Main Agent and each SubAgent system prompt can be overridden here. Changes apply after reinitialization.")
+
+    prompt_defaults = get_default_subagent_system_prompts()
+    current_main_override = st.text_area(
+        "Main Agent Prompt Override",
+        value=settings.main_system_prompt_override,
+        height=220,
+        help="Appended to the default Main Agent system prompt.",
+    )
+
+    prompt_inputs: dict[str, str] = {}
+    for name, default_prompt in prompt_defaults.items():
+        with st.expander(f"{name} prompt", expanded=False):
+            st.caption("Default prompt shown below. Add an override only when you need to change behavior.")
+            st.code(default_prompt, language="text")
+            prompt_inputs[name] = st.text_area(
+                f"{name} override",
+                value=settings.subagent_system_prompt_overrides.get(name, ""),
+                height=180,
+                key=f"subagent_prompt_override_{name}",
+                help=f"Override for the {name} subagent system prompt.",
+            )
+
+    col_prompt_save, col_prompt_reset = st.columns(2)
+    with col_prompt_save:
+        save_prompts = st.button("Save Prompt Overrides", use_container_width=True)
+    with col_prompt_reset:
+        reset_prompts = st.button("Reset Prompt Overrides", use_container_width=True)
+
+    if save_prompts:
+        settings.main_system_prompt_override = current_main_override.strip()
+        settings.subagent_system_prompt_overrides = {
+            name: value.strip()
+            for name, value in prompt_inputs.items()
+            if value.strip()
+        }
+        settings.save_prompt_overrides()
+        st.session_state.agent_components = None
+        st.session_state.initialized = False
+        st.success("Prompt overrides saved. The agent will rebuild with the new prompts.")
+
+    if reset_prompts:
+        settings.main_system_prompt_override = ""
+        settings.subagent_system_prompt_overrides = {}
+        settings.save_prompt_overrides()
+        st.session_state.agent_components = None
+        st.session_state.initialized = False
+        st.success("Prompt overrides cleared. The default prompts will be used after reinitialization.")
+        st.rerun()
+
+    st.markdown("---")
 
     # Memory Settings
     st.subheader("🧠 Memory")
@@ -142,7 +195,9 @@ def render_settings() -> None:
     topology = st.selectbox(
         "Deployment Topology",
         options=["single", "split", "hybrid"],
-        index=["single", "split", "hybrid"].index(settings.deployment_topology if settings.deployment_topology in {"single", "split", "hybrid"} else "split"),
+        index=["single", "split", "hybrid"].index(
+            settings.deployment_topology if settings.deployment_topology in {"single", "split", "hybrid"} else "split"
+        ),
         help="single=langgraph co-deploy(ASGI), split=HTTP runtimes, hybrid=mixed",
     )
     if topology != settings.deployment_topology:

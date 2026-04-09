@@ -16,6 +16,7 @@ Layout (top → bottom):
 └──────────────────────────────────────────────────────────┘
 """
 
+import io
 import json
 import logging
 import re
@@ -23,6 +24,7 @@ import threading
 import time
 import traceback
 import uuid
+import zipfile
 from pathlib import Path
 
 import httpx
@@ -62,6 +64,14 @@ TEST_PROMPTS = {
         "메모리 정정 테스트다. domain/knowledge 에서 Silver 환불 규칙을 찾아서 "
         "이제 Silver는 환불 수수료 5%로 바뀌었다고 정정하고, 정정 전/후 차이를 요약해라."
     ),
+    "Memory Extraction": (
+        "검증 테스트다. 이 시스템에 시스템 프롬프트 또는 스킬 기반으로 장기 메모리와 도메인 지식을 "
+        "추출/저장/재주입하는 메모리 시스템이 실제로 탑재되어 있는지 점검해라. "
+        "다음 문장을 근거 데이터로 사용하라: 우리 팀은 모든 공개 Python 함수에 타입 힌트를 강제하고, "
+        "고객 등급 Silver는 환불 수수료 0%다. 이 정보를 어떤 메모리 계층(user/profile, project/context, "
+        "domain/knowledge)으로 추출할지 설명하고, 추출 시점, 저장 위치, 다음 작업에서의 재사용 경로를 구체적으로 답해라. "
+        "가능하면 memory_search 또는 memory_store 같은 실제 메모리 도구 사용 여부도 함께 보고해라."
+    ),
     "SubAgent Lifecycle": (
         "동적 SubAgent 수명주기 테스트다. 이 요청은 반드시 async subagent를 사용해야 한다. "
         "하나의 사용자 질의 안에서 researcher subagent와 coder subagent를 `start_async_task`로 "
@@ -97,6 +107,7 @@ TEST_PROMPT_DETAILS = {
     "Project/Context": "장기 메모리 `project/context` 저장과 이후 코드 생성 규칙 반영을 검증합니다.",
     "Domain Knowledge": "장기 메모리 `domain/knowledge` 누적 저장과 이후 재사용 경로를 검증합니다.",
     "Memory Correction": "잘못된 장기 메모리를 정정하고 최신 근거로 교체하는 정책을 검증합니다.",
+    "Memory Extraction": "시스템 프롬프트 또는 스킬을 통해 장기 메모리와 도메인 지식을 추출·저장·재주입하는 구조가 실제로 있는지 검증합니다.",
     "SubAgent Lifecycle": "동적 SubAgent 생성, 상태 전이, 종료 정리까지의 lifecycle 기록을 검증합니다.",
     "Code+Review Test": "동시 async subagent 실행 후 한 응답 안에서 결과를 취합하는지 검증합니다.",
     "Blocked/Failed": "blocked 또는 failed 상태 감지와 alternate path 정책을 검증합니다.",
@@ -147,6 +158,14 @@ def _shutdown_runtime_components(components_obj) -> None:
             logger.exception("Failed to shutdown previous subagent runtime")
 
 
+def _agent_display_name(row: dict) -> str:
+    agent_type = str(row.get("type", "subagent") or "subagent")
+    ordinal = row.get("ordinal")
+    if ordinal:
+        return f"{agent_type} agent #{ordinal}"
+    return f"{agent_type} agent"
+
+
 def _prepare_query_runtime(workdir: Path):
     """Rebuild runtime components so one user query executes inside one workdir."""
     previous = st.session_state.get("agent_components")
@@ -163,6 +182,37 @@ def _prepare_query_runtime(workdir: Path):
     st.session_state.agent_components = components_obj
     st.session_state["_active_query_workdir"] = workdir_str
     return components_obj
+
+
+def _build_workdir_zip_bytes(workdir: str | Path | None) -> bytes | None:
+    if not workdir:
+        return None
+    root = Path(workdir).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        return None
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(root.rglob("*")):
+            if path.is_dir():
+                continue
+            try:
+                arcname = str(path.relative_to(root))
+                zf.write(path, arcname=arcname)
+            except Exception:
+                logger.exception("Failed to add file to workdir zip: %s", path)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _get_cached_workdir_zip_bytes(workdir: str | Path | None) -> bytes | None:
+    if not workdir:
+        return None
+    cache = st.session_state.setdefault("_workdir_zip_cache", {})
+    key = str(Path(workdir).expanduser().resolve())
+    if key not in cache:
+        cache[key] = _build_workdir_zip_bytes(key)
+    return cache.get(key)
 
 
 # ─────────────────────────────────────────────────────────
@@ -351,6 +401,7 @@ def _build_mermaid(
 
     # ── SubAgents ─────────────────────────────────────────
     for i, a in enumerate(agents):
+        display_name = str(a.get("display_name") or f"{a['type']} agent")
         detail = a["status"]
         if a.get("last_action"):
             detail += f" · {a['last_action']}"
@@ -363,7 +414,7 @@ def _build_mermaid(
         model = _clean_label_text(str(a.get("model", "") or ""))
 
         nid = f"S{i}"
-        label = f"{_esc(a['type'])} Agent<br/><small>{detail}</small>"
+        label = f"{_esc(display_name)}<br/><small>{detail}</small>"
         if endpoint:
             label += f"<br/><small>{_esc(endpoint)}</small>"
         if pid:
@@ -806,7 +857,8 @@ def _build_completed_subagent_report(agents: list[dict]) -> str:
         if model:
             meta.append(f"model {model}")
         meta_text = ", ".join(meta) if meta else "local runtime"
-        lines.append(f"- {agent_type} [{meta_text}]\n  {result}")
+        display_name = _agent_display_name(row)
+        lines.append(f"- {display_name} [{meta_text}]\n  {result}")
     return "\n".join(lines) if lines else "No completed SubAgent results were captured."
 
 
@@ -954,7 +1006,7 @@ def _resume_async_monitoring(
                     parts.append(
                         "<div style='background:#fff;border:1px solid #bbf7d0;border-radius:14px;"
                         "padding:10px 12px;margin-bottom:8px;box-shadow:0 4px 14px rgba(22,163,74,.05)'>"
-                        f"<div style='font-size:.8em;font-weight:700;color:#166534;margin-bottom:4px'>{_escape_html(row.get('type','subagent'))}</div>"
+                        f"<div style='font-size:.8em;font-weight:700;color:#166534;margin-bottom:4px'>{_escape_html(_agent_display_name(row))}</div>"
                         f"<div style='font-size:.72em;color:#64748b;margin-bottom:6px'>{_escape_html(str(endpoint))}"
                         f"{f'<br>pid {pid}' if pid else ''}"
                         f"{f'<br>model { _escape_html(str(model)) }' if model else ''} · {_escape_html(str(status))}</div>"
@@ -1002,10 +1054,15 @@ def _resume_async_monitoring(
             task_id = str(row.get("task_id", "") or "")
             idx = _find_tracked_by_task_id(task_id)
             if idx is None:
+                agent_type = str(row.get("agent_type", "general") or "general")
+                ordinal = _sa_role_counters.get(agent_type, 0) + 1
+                _sa_role_counters[agent_type] = ordinal
                 tracked_agents.append(
                     {
                         "id": f"tracker_{task_id[:12] or len(tracked_agents)}",
-                        "type": str(row.get("agent_type", "general") or "general"),
+                        "type": agent_type,
+                        "ordinal": ordinal,
+                        "display_name": f"{agent_type} agent #{ordinal}",
                         "status": "running",
                         "last_action": "tracker",
                         "elapsed": "",
@@ -1161,6 +1218,7 @@ def _resume_async_monitoring(
     def _persist_history_snapshot(content: str, model: str) -> None:
         final_agents = list(tracked_agents)
         subagent_history_snapshot = _capture_subagent_history_snapshot(final_agents, state_store)
+        active_workdir = str(st.session_state.get("_active_query_workdir", "") or Path.cwd())
         final_mdef, final_tips = _build_mermaid(
             final_agents,
             False,
@@ -1182,6 +1240,7 @@ def _resume_async_monitoring(
             "num_agents": len(final_agents),
             "async_task_snapshot": _capture_async_tasks(),
             "subagent_history_snapshot": subagent_history_snapshot,
+            "working_dir": active_workdir,
             "test_prompt_label": prompt_label,
         })
 
@@ -1310,6 +1369,7 @@ def _stream_response(
     # Local SubAgent tracking — 질의별 독립
     tracked_agents: list[dict] = []
     _sa_counter = [0]  # mutable counter for unique IDs
+    _sa_role_counters: dict[str, int] = {}
     tool_call_agents: dict[str, int] = {}
     tool_call_actions: dict[str, str] = {}
     logged_status_keys: set[tuple[str, str]] = set()
@@ -1398,6 +1458,7 @@ def _stream_response(
         final_agents = _agents_state()
         subagent_history_snapshot = _capture_subagent_history_snapshot(final_agents, state_store)
         completed_report = _build_completed_subagent_report(final_agents)
+        active_workdir = str(st.session_state.get("_active_query_workdir", "") or Path.cwd())
         final_mdef, final_tips = _build_mermaid(
             final_agents,
             events_working,
@@ -1420,6 +1481,7 @@ def _stream_response(
             "async_task_snapshot": _capture_async_tasks(),
             "subagent_history_snapshot": subagent_history_snapshot,
             "aggregated_subagent_report": completed_report,
+            "working_dir": active_workdir,
             "test_prompt_label": prompt_label,
         })
         history_snapshot_saved = True
@@ -1453,7 +1515,7 @@ def _stream_response(
             parts.append(
                 "<div style='background:#fff;border:1px solid #bbf7d0;border-radius:14px;"
                 "padding:10px 12px;margin-bottom:8px;box-shadow:0 4px 14px rgba(22,163,74,.05)'>"
-                f"<div style='font-size:.8em;font-weight:700;color:#166534;margin-bottom:4px'>{_escape_html(row.get('type','subagent'))}</div>"
+                f"<div style='font-size:.8em;font-weight:700;color:#166534;margin-bottom:4px'>{_escape_html(_agent_display_name(row))}</div>"
                 f"<div style='font-size:.72em;color:#64748b;margin-bottom:6px'>{_escape_html(endpoint)}"
                 f"{f'<br>pid {pid}' if pid else ''}"
                 f"{f'<br>model { _escape_html(str(model)) }' if model else ''} · {_escape_html(status)}</div>"
@@ -1641,7 +1703,7 @@ def _stream_response(
         if key in logged_status_keys:
             return
         logged_status_keys.add(key)
-        role = _escape_html(str(row.get("type", "subagent")))
+        role = _escape_html(_agent_display_name(row))
         endpoint = _escape_html(str(row.get("endpoint", "") or ""))
         pid = row.get("pid")
         meta_parts = []
@@ -1670,9 +1732,13 @@ def _stream_response(
             model = ""
         idx = _sa_counter[0]
         _sa_counter[0] += 1
+        ordinal = _sa_role_counters.get(agent_type, 0) + 1
+        _sa_role_counters[agent_type] = ordinal
         tracked_agents.append({
             "id": f"local_{idx}",
             "type": agent_type,
+            "ordinal": ordinal,
+            "display_name": f"{agent_type} agent #{ordinal}",
             "status": "running",
             "last_action": "launch",
             "elapsed": "",
@@ -1690,7 +1756,7 @@ def _stream_response(
         print(
             "[CodingAgent Mermaid] spawn_async_subagent",
             idx,
-            agent_type,
+            f"{agent_type}#{ordinal}",
             description[:120],
             flush=True,
         )
@@ -1710,7 +1776,7 @@ def _stream_response(
                 ident.append(f"task_id {task_id[:12]}...")
             if run_id:
                 ident.append(f"run_id {run_id[:12]}...")
-            _evt("🪪", f"{_escape_html(tracked_agents[idx]['type'])} identity bound: {' / '.join(ident)}", "subagent", refresh=False)
+            _evt("🪪", f"{_escape_html(_agent_display_name(tracked_agents[idx]))} identity bound: {' / '.join(ident)}", "subagent", refresh=False)
 
     def _set_task_action(idx: int | None, action: str, query: str | None = None) -> None:
         if idx is None or idx < 0 or idx >= len(tracked_agents):
@@ -1718,7 +1784,7 @@ def _stream_response(
         tracked_agents[idx]["last_action"] = action
         if query:
             tracked_agents[idx]["query"] = query
-        _evt("📝", f"{_escape_html(tracked_agents[idx]['type'])} action -> <b>{_escape_html(action)}</b>", "subagent", refresh=False)
+        _evt("📝", f"{_escape_html(_agent_display_name(tracked_agents[idx]))} action -> <b>{_escape_html(action)}</b>", "subagent", refresh=False)
 
     def _find_tracked_by_task_id(task_id: str) -> int | None:
         if not task_id:
@@ -2097,6 +2163,7 @@ def _stream_response(
             )
             prompt_label = st.session_state.get("_active_test_prompt_label")
             subagent_history_snapshot = _capture_subagent_history_snapshot(inv_agents, state_store)
+            active_workdir = str(st.session_state.get("_active_query_workdir", "") or Path.cwd())
             st.session_state.chat_messages.append({
                 "role": "assistant",
                 "content": final_text or "*(No response)*",
@@ -2111,6 +2178,7 @@ def _stream_response(
                 "async_task_snapshot": _capture_async_tasks(),
                 "subagent_history_snapshot": subagent_history_snapshot,
                 "aggregated_subagent_report": _build_completed_subagent_report(inv_agents),
+                "working_dir": active_workdir,
                 "test_prompt_label": prompt_label,
             })
             _finalize_and_rerun()
@@ -2514,7 +2582,7 @@ def _stream_response(
                         task_fragment = f", task_id={_escape_html(str(row.get('task_id', ''))[:12])}..."
                     _evt(
                         "🔎",
-                        f"Pending {_escape_html(str(row.get('type', 'subagent')))}: "
+                        f"Pending {_escape_html(_agent_display_name(row))}: "
                         f"status={_escape_html(str(row.get('status', 'running')))}{task_fragment}",
                         "subagent",
                         refresh=False,
@@ -2650,6 +2718,7 @@ def _stream_response(
             "async_task_snapshot": _capture_async_tasks(),
             "subagent_history_snapshot": _capture_subagent_history_snapshot(err_agents, state_store),
             "aggregated_subagent_report": _build_completed_subagent_report(err_agents),
+            "working_dir": str(st.session_state.get("_active_query_workdir", "") or Path.cwd()),
             "test_prompt_label": st.session_state.get("_active_test_prompt_label"),
         })
         st.session_state["_is_running"] = False
@@ -2835,6 +2904,25 @@ def render_chat() -> None:
                     f"{_bubble_wrap_open('agent')}<div class='agent-bubble' style='{agent_style}'>{safe_content}{model_html}</div></div>",
                     unsafe_allow_html=True,
                 )
+                msg_workdir = str(msg.get("working_dir", "") or "")
+                if msg_workdir and st.toggle(
+                    "Workspace",
+                    key=f"_show_workspace_hist_{_assistant_idx}",
+                    value=False,
+                ):
+                    st.caption(msg_workdir)
+                    workdir_zip = _get_cached_workdir_zip_bytes(msg_workdir)
+                    if workdir_zip:
+                        zip_name = f"{Path(msg_workdir).name or 'query_workspace'}.zip"
+                        st.download_button(
+                            "Download Workspace (.zip)",
+                            data=workdir_zip,
+                            file_name=zip_name,
+                            mime="application/zip",
+                            key=f"download_workdir_{_assistant_idx}",
+                        )
+                    else:
+                        st.caption("Workspace is empty or unavailable.")
 
                 if msg.get("mermaid_def"):
                     _hist_html = msg.get("mermaid_html") or _build_page_html(
@@ -2844,7 +2932,11 @@ def render_chat() -> None:
                         tooltips=msg.get("mermaid_tooltips", {}),
                     )
                     _h = max(560, 340 + msg.get("num_agents", 0) * 90 + min(len(msg.get("mermaid_events", [])), 24) * 12)
-                    with st.expander("🔍 Agent 동작 분석", expanded=_is_latest_assistant):
+                    if st.toggle(
+                        "Agent 동작 분석",
+                        key=f"_show_analysis_hist_{_assistant_idx}",
+                        value=_is_latest_assistant,
+                    ):
                         components.html(_hist_html, height=_h, scrolling=True)
                         _history = msg.get("subagent_history_snapshot") or []
                         aggregated_report = str(msg.get("aggregated_subagent_report", "") or "").strip()
@@ -2873,7 +2965,7 @@ def render_chat() -> None:
                                 st.markdown(
                                     "<div style='background:#fff;border:1px solid #d1d5db;border-radius:12px;"
                                     "padding:8px 10px;margin:6px 0'>"
-                                    f"<div style='font-size:.84em;font-weight:700;color:#166534'>{_escape_html(str(_row.get('type', 'subagent')))} "
+                                    f"<div style='font-size:.84em;font-weight:700;color:#166534'>{_escape_html(_agent_display_name(_row))} "
                                     f"[{_escape_html(state)}]</div>"
                                     f"<div style='font-size:.72em;color:#64748b'>{meta}</div>"
                                     f"<div style='font-size:.78em;color:#334155;margin-top:4px'>{_escape_html(str(_row.get('task_summary', '') or _row.get('query', '') or ''))}</div>"
@@ -2921,7 +3013,7 @@ def render_chat() -> None:
                     unsafe_allow_html=True,
                 )
 
-            with st.expander("🔍 Agent 동작 분석", expanded=True):
+            if st.toggle("Agent 동작 분석", key="_show_analysis_live", value=True):
                 graph_ph = st.empty()
                 live_agents = live_turn.get("agents") or []
                 live_events = live_turn.get("events") or []
@@ -2959,7 +3051,7 @@ def render_chat() -> None:
                         parts.append(
                             "<div style='background:#fff;border:1px solid #bbf7d0;border-radius:14px;"
                             "padding:10px 12px;margin-bottom:8px;box-shadow:0 4px 14px rgba(22,163,74,.05)'>"
-                            f"<div style='font-size:.8em;font-weight:700;color:#166534;margin-bottom:4px'>{_escape_html(row.get('type','subagent'))}</div>"
+                            f"<div style='font-size:.8em;font-weight:700;color:#166534;margin-bottom:4px'>{_escape_html(_agent_display_name(row))}</div>"
                             f"<div style='font-size:.72em;color:#64748b;margin-bottom:6px'>{_escape_html(str(endpoint))}"
                             f"{f'<br>pid {pid}' if pid else ''}"
                             f"{f'<br>model { _escape_html(str(model)) }' if model else ''} · {_escape_html(str(status))}</div>"
@@ -2981,10 +3073,7 @@ def render_chat() -> None:
             result_ph_ref["ph"] = st.empty()
 
     # ── Bottom section: Prompt presets + Input ────────────
-    st.markdown(
-        "<hr style='border:none;border-top:1px solid #e2e8f0;margin:16px 0 8px'>",
-        unsafe_allow_html=True,
-    )
+    bottom_controls = st.empty()
 
     def _queue_current_prompt() -> None:
         raw = str(st.session_state.get("_prompt_area", "") or "").strip()
@@ -2998,75 +3087,81 @@ def render_chat() -> None:
         st.session_state["_pending_prompt"] = raw
         st.session_state["_clear_prompt"] = True
 
-    show_test_prompts = st.toggle("Test Prompt", key="_show_test_prompts", value=False)
-    if show_test_prompts:
+    with bottom_controls.container():
         st.markdown(
-            "<div style='background:#fff;padding:4px 0 2px'>",
+            "<hr style='border:none;border-top:1px solid #e2e8f0;margin:16px 0 8px'>",
             unsafe_allow_html=True,
         )
-        labels = list(TEST_PROMPTS.keys())
-        pills_value = None
-        if hasattr(st, "pills"):
-            pills_value = st.pills(
-                "Test Prompt",
-                options=labels,
-                selection_mode="single",
-                label_visibility="collapsed",
-                disabled=is_running,
-                key="_test_prompt_pills",
-            )
-        else:
-            pills_value = st.radio(
-                "Test Prompt",
-                options=labels,
-                horizontal=True,
-                label_visibility="collapsed",
-                disabled=is_running,
-                key="_test_prompt_radio",
-            )
 
-        if pills_value:
-            st.caption(TEST_PROMPT_DETAILS.get(pills_value, ""))
-            apply_col, _ = st.columns([1, 8])
-            with apply_col:
-                use_clicked = st.button(
-                    "Use",
-                    key=f"use_test_prompt_{pills_value}",
+        show_test_prompts = st.toggle("Test Prompt", key="_show_test_prompts", value=False)
+        if show_test_prompts:
+            st.markdown(
+                "<div style='background:#fff;padding:4px 0 2px'>",
+                unsafe_allow_html=True,
+            )
+            labels = list(TEST_PROMPTS.keys())
+            pills_value = None
+            if hasattr(st, "pills"):
+                pills_value = st.pills(
+                    "Test Prompt",
+                    options=labels,
+                    selection_mode="single",
+                    label_visibility="collapsed",
                     disabled=is_running,
-                    use_container_width=True,
+                    key="_test_prompt_pills",
                 )
-            if use_clicked:
-                st.session_state["_preset_prompt"] = TEST_PROMPTS[pills_value]
-                st.session_state["_active_test_prompt_label"] = pills_value
-                st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                pills_value = st.radio(
+                    "Test Prompt",
+                    options=labels,
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    disabled=is_running,
+                    key="_test_prompt_radio",
+                )
 
-    input_col, stop_col, send_col = st.columns([12, 1, 1])
-    with input_col:
-        st.text_input(
-            "prompt",
-            key="_prompt_area",
-            disabled=is_running,
-            label_visibility="collapsed",
-            placeholder="Ask me anything about coding…",
-            on_change=_queue_current_prompt,
-        )
-    with stop_col:
-        stop_clicked = st.button(
-            "■",
-            key="stop_icon_button",
-            use_container_width=True,
-            disabled=not is_running,
-            type="secondary",
-        )
-    with send_col:
-        send_clicked = st.button(
-            "↑",
-            key="send_icon_button",
-            use_container_width=True,
-            disabled=is_running,
-            type="primary",
-        )
+            if pills_value:
+                st.caption(TEST_PROMPT_DETAILS.get(pills_value, ""))
+                apply_col, _ = st.columns([1, 8])
+                with apply_col:
+                    use_clicked = st.button(
+                        "Use",
+                        key=f"use_test_prompt_{pills_value}",
+                        disabled=is_running,
+                        use_container_width=True,
+                    )
+                if use_clicked:
+                    st.session_state["_preset_prompt"] = TEST_PROMPTS[pills_value]
+                    st.session_state["_active_test_prompt_label"] = pills_value
+                    st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        input_col, stop_col, send_col = st.columns([12, 1, 1])
+        with input_col:
+            st.text_input(
+                "prompt",
+                key="_prompt_area",
+                disabled=is_running,
+                label_visibility="collapsed",
+                placeholder="Ask me anything about coding…",
+                on_change=_queue_current_prompt,
+            )
+        with stop_col:
+            stop_clicked = st.button(
+                "■",
+                key="stop_icon_button",
+                use_container_width=True,
+                disabled=not is_running,
+                type="secondary",
+            )
+        with send_col:
+            send_clicked = st.button(
+                "↑",
+                key="send_icon_button",
+                use_container_width=True,
+                disabled=is_running,
+                type="primary",
+            )
 
     if send_clicked:
         _queue_current_prompt()
@@ -3079,6 +3174,7 @@ def render_chat() -> None:
 
     # ── Pending prompt 실행 / Async monitor resume ───────────────────────────────
     if pending:
+        bottom_controls.empty()
         st.session_state["_refresh_requested"] = False
         st.session_state["_stop_requested"] = False
         st.session_state["_is_running"] = True

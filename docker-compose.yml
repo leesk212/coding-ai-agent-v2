@@ -1,6 +1,6 @@
 services:
   coding-agent:
-    image: ${CODING_AGENT_IMAGE:-leesk212/coding-ai-agent-v4:latest}
+    image: ${CODING_AGENT_IMAGE:-leesk212/coding-ai-agent-v5:latest}
     build:
       context: .
       dockerfile: Dockerfile

@@ -117,6 +117,13 @@ DEFAULT_ASYNC_SUBAGENTS: dict[str, dict[str, Any]] = {
 }
 
 
+def get_default_subagent_system_prompts() -> dict[str, str]:
+    return {
+        name: str(meta.get("system_prompt", "")).strip()
+        for name, meta in DEFAULT_ASYNC_SUBAGENTS.items()
+    }
+
+
 def _read_async_subagent_section(config_path: Path | None = None) -> dict[str, Any]:
     """Read the raw `[async_subagents]` section from `config.toml`.
 
@@ -285,7 +292,17 @@ class LocalAsyncSubagentManager:
         self.root_dir = (root_dir or Path.cwd()).resolve()
         self.topology = (topology or self.cfg.deployment_topology or "single").strip().lower()
         loaded = load_async_subagents()
-        self._subagents = self._merge_subagents(DEFAULT_ASYNC_SUBAGENTS, loaded, subagents or {})
+        prompt_overrides = {
+            name: {"system_prompt": prompt}
+            for name, prompt in (self.cfg.subagent_system_prompt_overrides or {}).items()
+            if str(prompt).strip()
+        }
+        self._subagents = self._merge_subagents(
+            DEFAULT_ASYNC_SUBAGENTS,
+            loaded,
+            prompt_overrides,
+            subagents or {},
+        )
         self._state_store = DurableStateStore(self.cfg.state_dir / "agent_state.db")
         self._processes: dict[str, LocalAsyncSubagentProcess] = {}
         self._pending_lifecycle_ids: dict[str, list[str]] = {}

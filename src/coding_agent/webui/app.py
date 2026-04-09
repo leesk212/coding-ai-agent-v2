@@ -38,6 +38,10 @@ st.markdown("""
 
 
 def _init_state():
+    if settings.deployment_topology != "split":
+        settings.deployment_topology = "split"
+        os.environ["DEEPAGENTS_DEPLOYMENT_TOPOLOGY"] = "split"
+
     defaults = {
         "agent_components": None,
         "chat_messages": [],
@@ -45,13 +49,9 @@ def _init_state():
         "init_error": None,
         "page": "chat",
         "mem_count": 0,
-        "prewarm_bundle": None,
-        "prewarm_complete": False,
-        "prewarm_error": None,
         "prewarm_started": False,
-        "prewarm_progress": 0,
-        "prewarm_logs": [],
-        "prewarm_status": None,
+        "prewarm_state": None,
+        "prewarm_bundle": None,
         "startup_setup_complete": False,
         "_conversation_thread_id": f"webui-{uuid.uuid4().hex}",
     }
@@ -107,9 +107,81 @@ def _persist_runtime_settings(
     os.environ["OPENAI_FALLBACK_MODEL"] = settings.openai_fallback_model.name
 
 
+def _start_prewarm_if_needed() -> None:
+    if st.session_state.get("prewarm_started"):
+        return
+
+    status = {
+        "progress": 1,
+        "logs": [],
+        "complete": False,
+        "error": None,
+        "bundle": None,
+    }
+    st.session_state.prewarm_started = True
+    st.session_state.prewarm_state = status
+
+    def worker(state: dict) -> None:
+        t_init_start = time.time()
+
+        def log(icon: str, msg: str, pct: int) -> None:
+            ts = time.strftime("%H:%M:%S")
+            elapsed = f"{time.time() - t_init_start:.1f}s"
+            state["logs"].append(f"[{ts}] (+{elapsed}) {icon} {msg}")
+            state["progress"] = pct
+
+        try:
+            log("⚙️", "Loading configuration...", 10)
+            log("🏗️", "Prewarming DeepAgents runtime...", 30)
+            from coding_agent.runtime import prewarm_runtime_components
+
+            bundle = prewarm_runtime_components(
+                custom_settings=settings,
+                cwd=Path.cwd(),
+                progress_cb=lambda msg: log("   ", msg, 70),
+            )
+            state["bundle"] = bundle
+            state["complete"] = True
+            state["error"] = None
+            log("✅", "DeepAgents runtime prewarm complete", 100)
+        except Exception:
+            state["error"] = traceback.format_exc()
+            state["logs"].append("[error] DeepAgents prewarm failed")
+
+    threading.Thread(
+        target=worker,
+        args=(status,),
+        daemon=True,
+        name="coding-agent-prewarm",
+    ).start()
+
+
+def _sync_prewarm_state_from_worker() -> None:
+    state = st.session_state.get("prewarm_state") or {}
+    bundle = state.get("bundle")
+    if bundle is not None:
+        st.session_state.prewarm_bundle = bundle
+
+
+@st.fragment(run_every=1)
+def _prewarm_status_fragment() -> None:
+    state = st.session_state.get("prewarm_state") or {}
+    if not state:
+        return
+    progress_val = int(state.get("progress", 0) or 0)
+    st.progress(max(0, min(progress_val, 100)))
+    logs = state.get("logs", []) or []
+    if logs:
+        st.code("\n".join(logs[-12:]), language="text")
+    if state.get("error"):
+        st.error("DeepAgents prewarm failed.")
+        st.code(str(state["error"]), language="python")
+
+
 def _render_startup_setup(area=None) -> None:
     host = area or st
     with host.container():
+        _start_prewarm_if_needed()
         st.markdown(
             "<h2 style='text-align:center'>Danny's Coding AI Agent</h2>"
             "<p style='text-align:center; color:#666'>"
@@ -170,11 +242,7 @@ def _render_startup_setup(area=None) -> None:
             submitted = st.form_submit_button("Start Danny's Chat", type="primary", use_container_width=True)
 
         if not submitted:
-            if st.session_state.get("prewarm_started"):
-                _render_prewarm_status()
-            else:
-                st.caption("Starting DeepAgents background initialization…")
-                _start_prewarm_if_needed()
+            _prewarm_status_fragment()
             st.info("OpenRouter API key is required. DeepAgents prewarm is running in parallel.")
             st.stop()
 
@@ -197,77 +265,6 @@ def _render_startup_setup(area=None) -> None:
         st.session_state.agent_components = None
         st.session_state.initialized = False
         st.session_state.init_error = None
-    if area is not None:
-        area.empty()
-
-
-def _start_prewarm_if_needed() -> None:
-    if st.session_state.prewarm_started or st.session_state.prewarm_complete:
-        return
-
-    st.session_state.prewarm_started = True
-    st.session_state.prewarm_progress = 1
-    st.session_state.prewarm_logs = []
-    st.session_state.prewarm_error = None
-    st.session_state.prewarm_status = {
-        "progress": 1,
-        "complete": False,
-        "error": None,
-        "bundle": None,
-    }
-
-    logs = st.session_state.prewarm_logs
-    status = st.session_state.prewarm_status
-
-    def worker() -> None:
-        t_init_start = time.time()
-
-        def log(icon: str, msg: str, pct: int) -> None:
-            ts = time.strftime("%H:%M:%S")
-            elapsed = f"{time.time() - t_init_start:.1f}s"
-            logs.append(f"[{ts}] (+{elapsed}) {icon} {msg}")
-            status["progress"] = pct
-
-        try:
-            log("⚙️", "Loading configuration...", 10)
-            log("🏗️", "Prewarming DeepAgents runtime...", 30)
-            from coding_agent.runtime import prewarm_runtime_components
-
-            bundle = prewarm_runtime_components(
-                custom_settings=settings,
-                cwd=Path.cwd(),
-                progress_cb=lambda msg: log("   ", msg, 70),
-            )
-            status["bundle"] = bundle
-            status["complete"] = True
-            status["error"] = None
-            log("✅", "DeepAgents runtime prewarm complete", 100)
-        except Exception:
-            status["error"] = traceback.format_exc()
-            logs.append("[error] DeepAgents prewarm failed")
-
-    thread = threading.Thread(target=worker, daemon=True, name="coding-agent-prewarm")
-    thread.start()
-
-
-def _render_prewarm_status() -> None:
-    status = st.session_state.get("prewarm_status") or {}
-    if status:
-        st.session_state.prewarm_progress = int(status.get("progress", 0) or 0)
-        st.session_state.prewarm_complete = bool(status.get("complete"))
-        st.session_state.prewarm_error = status.get("error")
-        if status.get("bundle") is not None:
-            st.session_state.prewarm_bundle = status["bundle"]
-
-    progress_val = int(st.session_state.get("prewarm_progress", 0) or 0)
-    st.progress(max(0, min(progress_val, 100)))
-    logs = st.session_state.get("prewarm_logs", []) or []
-    if logs:
-        st.code("\n".join(logs[-12:]), language="text")
-    if st.session_state.get("prewarm_error"):
-        st.error("DeepAgents prewarm failed.")
-        st.code(st.session_state.prewarm_error, language="python")
-        st.stop()
 
 
 def _init_agent(area=None):
@@ -275,6 +272,8 @@ def _init_agent(area=None):
         return
 
     init_area = area or st.empty()
+    if area is not None:
+        init_area.empty()
     with init_area.container():
         st.markdown(
             "<h2 style='text-align:center'>Danny's Coding AI Agent</h2>"
@@ -295,7 +294,6 @@ def _init_agent(area=None):
             log_area.code("\n".join(logs), language="text")
 
         try:
-            _render_prewarm_status()
             log("⚙️", "Loading configuration...", 10)
             from coding_agent.config import settings
             key_ok = "✓" if settings.openrouter_api_key else "✗ NOT SET"
@@ -320,6 +318,8 @@ def _init_agent(area=None):
             t0 = time.time()
             log("🏗️", "Creating DeepAgents supervisor...", 55)
             from coding_agent.runtime import create_runtime_components, finalize_runtime_components
+
+            _sync_prewarm_state_from_worker()
             prewarm_bundle = st.session_state.get("prewarm_bundle")
             if prewarm_bundle is not None:
                 log("🧩", "Using prewarmed DeepAgents runtime bundle", 58)
@@ -330,6 +330,11 @@ def _init_agent(area=None):
                     progress_cb=lambda msg: log("   ", msg, 70),
                 )
             else:
+                prewarm_state = st.session_state.get("prewarm_state") or {}
+                if prewarm_state.get("error"):
+                    log("⚠️", "Background prewarm failed; falling back to direct initialization", 58)
+                elif prewarm_state and not prewarm_state.get("complete"):
+                    log("⏳", "Background prewarm still running; falling back to direct initialization", 58)
                 components = create_runtime_components(
                     cwd=Path.cwd(),
                     progress_cb=lambda msg: log("   ", msg, 70),

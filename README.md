@@ -498,7 +498,7 @@ docker compose --profile with-ollama up --build
 | `MEMORY_DIR` | semantic memory storage path | `~/.coding_agent/memory` |
 | `STATE_DIR` | durable SQLite state path | `~/.coding_agent/state` |
 | `CODING_AGENT_PORT` | compose-exposed Streamlit port | `8501` |
-| `CODING_AGENT_IMAGE` | Docker image name used by compose | `leesk212/coding-ai-agent-v4:latest` |
+| `CODING_AGENT_IMAGE` | Docker image name used by compose | `leesk212/coding-ai-agent-v5:latest` |
 
 ## 테스트
 
