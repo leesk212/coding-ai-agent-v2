@@ -1,38 +1,52 @@
 services:
   coding-agent:
-    build: .
+    image: ${CODING_AGENT_IMAGE:-leesk212/coding-ai-agent-v2:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coding-ai-agent
     ports:
-      - "8501:8501"
+      - "${CODING_AGENT_PORT:-8501}:8501"
+    env_file:
+      - .env
     environment:
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
-      - LOCAL_FALLBACK_MODEL=${LOCAL_FALLBACK_MODEL:-qwen2.5-coder:7b}
-      - MEMORY_DIR=/root/.coding_agent/memory
-      - MAX_SUBAGENTS=${MAX_SUBAGENTS:-3}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      LOCAL_FALLBACK_MODEL: ${LOCAL_FALLBACK_MODEL:-qwen2.5-coder:7b}
+      MEMORY_DIR: /data/memory
+      STATE_DIR: /data/state
+      DEEPAGENTS_DEPLOYMENT_TOPOLOGY: ${DEEPAGENTS_DEPLOYMENT_TOPOLOGY:-split}
+      LANGGRAPH_DEPLOYMENT_URL: ${LANGGRAPH_DEPLOYMENT_URL:-}
+      LANGGRAPH_ASSISTANT_ID: ${LANGGRAPH_ASSISTANT_ID:-supervisor}
+      ASYNC_SUBAGENT_HOST: ${ASYNC_SUBAGENT_HOST:-127.0.0.1}
+      ASYNC_SUBAGENT_BASE_PORT: ${ASYNC_SUBAGENT_BASE_PORT:-30240}
+      MAX_SUBAGENTS: ${MAX_SUBAGENTS:-3}
+      CODING_AGENT_DEBUG: ${CODING_AGENT_DEBUG:-0}
     volumes:
-      # Persist long-term memory across restarts
-      - agent-memory:/root/.coding_agent/memory
-      # Mount working directory for file operations
       - ./workspace:/workspace
+      - coding-agent-memory:/data/memory
+      - coding-agent-state:/data/state
+      - coding-agent-deepagents:/root/.deepagents
+    working_dir: /workspace
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
-  # Optional: Local LLM via Ollama
   ollama:
     image: ollama/ollama:latest
+    profiles: ["with-ollama"]
     ports:
       - "11434:11434"
     volumes:
       - ollama-models:/root/.ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    profiles:
-      - with-ollama
+    restart: unless-stopped
 
 volumes:
-  agent-memory:
+  coding-agent-memory:
+  coding-agent-state:
+  coding-agent-deepagents:
   ollama-models:

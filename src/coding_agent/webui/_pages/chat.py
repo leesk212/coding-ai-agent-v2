@@ -657,7 +657,7 @@ def _render_mermaid(
     tooltips: dict[str, str] | None = None,
 ) -> None:
     """Render Mermaid flowchart + event feed inside an iframe."""
-    h = max(420, 260 + num_agents * 70)
+    h = max(520, 320 + num_agents * 90 + min(len(events), 24) * 12)
     st.session_state["_mermaid_render_seq"] = (
         st.session_state.get("_mermaid_render_seq", 0) + 1
     )
@@ -682,76 +682,7 @@ def _render_mermaid(
     )
     placeholder.empty()
     with placeholder.container():
-        components.html(html, height=h, scrolling=False)
-
-
-def _build_requirement_checklist(
-    prompt_label: str | None,
-    content: str,
-    tools_used: list[dict],
-    async_snapshot: list[dict],
-    activity_log: list[tuple[str, str]] | None = None,
-) -> list[tuple[str, bool]]:
-    text = (content or "").lower()
-    tool_names = {str(t.get("name", "")).lower() for t in tools_used}
-    statuses = {str(row.get("status", "")).lower() for row in (async_snapshot or [])}
-    activity_text = " ".join(msg.lower() for _icon, msg in (activity_log or []))
-
-    if prompt_label == "User/Profile":
-        return [
-            ("user/profile 메모리 저장 언급", "user/profile" in text or "user_preferences" in text or "user/profile" in activity_text),
-            ("메모리 조회 수행", "memory_search" in tool_names or "search" in activity_text),
-            ("향후 응답 반영 설명", "반영" in content or "reuse" in text or "이후" in content),
-        ]
-    if prompt_label == "Project/Context":
-        return [
-            ("project/context 메모리 저장 언급", "project/context" in text or "project_context" in text),
-            ("프로젝트 규칙 조회", "memory_search" in tool_names or "search" in activity_text),
-            ("코드 생성 규칙 반영 설명", "type" in text or "pytest" in text or "pydantic" in text),
-        ]
-    if prompt_label == "Domain Knowledge":
-        return [
-            ("domain/knowledge 저장 언급", "domain/knowledge" in text or "domain_knowledge" in text),
-            ("도메인 규칙 조회", "memory_search" in tool_names or "search" in activity_text),
-            ("환불 규칙 재사용 설명", "silver" in text and "refund" in text or "환불" in content),
-        ]
-    if prompt_label == "Memory Correction":
-        return [
-            ("기존 메모리 탐색", "memory_search" in tool_names or "search" in activity_text),
-            ("정정 도구 또는 정정 설명", "memory_correct" in tool_names or "정정" in content),
-            ("정정 전/후 비교", "전" in content and "후" in content or "before" in text and "after" in text),
-        ]
-    if prompt_label == "SubAgent Lifecycle":
-        return [
-            ("SubAgent 생성", "start_async_task" in tool_names or "launching" in activity_text),
-            ("상태 전이 관찰", any(s in statuses for s in {"completed", "running", "failed", "cancelled"}) or "created" in text),
-            ("종료/정리 요약", "destroyed" in text or "cleanup" in activity_text or "정리" in content),
-        ]
-    if prompt_label == "Code+Review Test":
-        return [
-            ("coder/reviewer 둘 다 실행", "start_async_task" in tool_names and ("review" in text or "reviewer" in text)),
-            ("같은 응답에서 취합", "same response" in text or "same response" in activity_text or "한 응답" in content),
-            ("최종 합성 결과", "synthesize" in text or "요약" in content or "final" in text),
-        ]
-    if prompt_label == "Blocked/Failed":
-        return [
-            ("blocked 또는 failed 감지", any(s in statuses for s in {"blocked", "failed"}) or "blocked" in text or "failed" in text),
-            ("대체 경로 실행", "alternate" in activity_text or "대체" in content),
-            ("상태 전이 요약", "state" in text or "상태 전이" in content),
-        ]
-    if prompt_label == "Loop Safety":
-        return [
-            ("timeout 설명", "timeout" in text),
-            ("tool 오류 설명", "tool" in text and ("error" in text or "오류" in content)),
-            ("safe stop 설명", "safe stop" in text or "안전" in content),
-        ]
-    if prompt_label == "Model Policy":
-        return [
-            ("현재 모델 식별", "model" in text or "모델" in content),
-            ("fallback 설명", "fallback" in text),
-            ("제약 설명", "제약" in content or "constraint" in text or "limit" in text),
-        ]
-    return []
+        components.html(html, height=h, scrolling=True)
 
 
 def _synthesize_subagent_results(agents: list[dict]) -> str:
@@ -796,6 +727,31 @@ def _synthesize_subagent_results(agents: list[dict]) -> str:
     if not lines:
         return "No completed SubAgent result was available to synthesize."
     return "\n".join(lines)
+
+
+def _build_completed_subagent_report(agents: list[dict]) -> str:
+    lines = []
+    for row in agents:
+        status = str(row.get("status", "") or row.get("durable_state", "")).lower()
+        if status != "completed":
+            continue
+        agent_type = str(row.get("type", "subagent"))
+        endpoint = str(row.get("endpoint", "") or "")
+        pid = row.get("pid")
+        model = str(row.get("model", "") or "")
+        result = str(row.get("result_summary", "") or row.get("live_output", "") or "").strip()
+        if not result:
+            result = "(no final result captured)"
+        meta = []
+        if endpoint:
+            meta.append(endpoint)
+        if pid:
+            meta.append(f"pid {pid}")
+        if model:
+            meta.append(f"model {model}")
+        meta_text = ", ".join(meta) if meta else "local runtime"
+        lines.append(f"- {agent_type} [{meta_text}]\n  {result}")
+    return "\n".join(lines) if lines else "No completed SubAgent results were captured."
 
 
 def _capture_subagent_history_snapshot(
@@ -1082,17 +1038,13 @@ def _resume_async_monitoring(
                     _evt("⛔", f"SubAgent <b>{_escape_html(agent_type)}</b> appears blocked", "error")
 
     def _unfinished_async_tasks() -> list[dict]:
-        rows = _sync_async_tasks_from_tracker()
+        _sync_async_tasks_from_tracker()
         unfinished: list[dict] = []
-        for row in rows:
-            task_id = str(row.get("task_id", "") or "")
-            idx = _find_tracked_by_task_id(task_id)
-            if idx is not None:
-                local_status = str(tracked_agents[idx].get("status", "")).lower()
-                if local_status in {"blocked", "completed", "failed", "cancelled"}:
-                    continue
-            if str(row.get("status", "")).lower() not in {"success", "completed", "error", "failed", "cancelled"}:
-                unfinished.append(row)
+        for row in tracked_agents:
+            local_status = str(row.get("status", "")).lower()
+            if local_status in {"completed", "failed", "cancelled"}:
+                continue
+            unfinished.append(row)
         return unfinished
 
     def _maybe_schedule_alternate_subagent() -> None:
@@ -1106,6 +1058,8 @@ def _resume_async_monitoring(
                 continue
             task_summary = str(row.get("query", "") or row.get("result_summary", "") or "recover prior subagent failure")
             _evt("🧭", f"Alternate path policy: launching <b>{alternate_role}</b> for {source_role} recovery", "subagent")
+            row["result_summary"] = row.get("result_summary") or f"{source_role} handed off to alternate role {alternate_role}."
+            row["status"] = "failed"
             try:
                 agent.invoke(
                     {
@@ -1149,13 +1103,6 @@ def _resume_async_monitoring(
             "async_task_snapshot": _capture_async_tasks(),
             "subagent_history_snapshot": subagent_history_snapshot,
             "test_prompt_label": prompt_label,
-            "requirement_checklist": _build_requirement_checklist(
-                prompt_label,
-                content,
-                [],
-                _capture_async_tasks(),
-                [(e["icon"], e["text"]) for e in events],
-            ),
         })
 
     def _cleanup_turn_subagents_async() -> None:
@@ -1195,13 +1142,17 @@ def _resume_async_monitoring(
     _evt("🧩", "All async subagents finished. Collecting results into one final answer", "subagent")
     try:
         loop_guard.reset()
+        completed_report = _build_completed_subagent_report(tracked_agents)
+        _evt("📦", "Completed SubAgent results prepared for Main Agent aggregation", "subagent")
         result = agent.invoke(
             {
                 "messages": [
                     HumanMessage(
                         content=(
                             "All async subagent tasks from this user turn should now be finished. "
-                            "Collect every completed result using live async task tools if needed, "
+                            "Below is the completed SubAgent result ledger gathered by the WebUI runtime. "
+                            "Use it as the primary aggregation source, and use live async task tools only if you need to verify details.\n\n"
+                            f"{completed_report}\n\n"
                             "then produce one final synthesized answer for the user. "
                             "Do not launch new async tasks unless absolutely required."
                         )
@@ -1280,6 +1231,7 @@ def _stream_response(
     _sa_counter = [0]  # mutable counter for unique IDs
     tool_call_agents: dict[str, int] = {}
     tool_call_actions: dict[str, str] = {}
+    logged_status_keys: set[tuple[str, str]] = set()
 
     # ── helpers ───────────────────────────────────────────
 
@@ -1364,6 +1316,7 @@ def _stream_response(
             return
         final_agents = _agents_state()
         subagent_history_snapshot = _capture_subagent_history_snapshot(final_agents, state_store)
+        completed_report = _build_completed_subagent_report(final_agents)
         final_mdef, final_tips = _build_mermaid(
             final_agents,
             events_working,
@@ -1372,13 +1325,6 @@ def _stream_response(
             model_name=model,
         )
         prompt_label = st.session_state.get("_active_test_prompt_label")
-        checklist = _build_requirement_checklist(
-            prompt_label,
-            content,
-            list(tools_used),
-            _capture_async_tasks(),
-            [(e["icon"], e["text"]) for e in events],
-        )
         st.session_state.chat_messages.append({
             "role": "assistant",
             "content": content,
@@ -1392,8 +1338,8 @@ def _stream_response(
             "num_agents": len(final_agents),
             "async_task_snapshot": _capture_async_tasks(),
             "subagent_history_snapshot": subagent_history_snapshot,
+            "aggregated_subagent_report": completed_report,
             "test_prompt_label": prompt_label,
-            "requirement_checklist": checklist,
         })
         history_snapshot_saved = True
         _clear_live_turn_state()
@@ -1420,6 +1366,7 @@ def _stream_response(
         for row in rows:
             endpoint = row.get("endpoint") or ""
             pid = row.get("pid")
+            model = row.get("model") or ""
             status = row.get("status", "running")
             content = row.get("live_output") or row.get("result_summary") or "waiting for output..."
             parts.append(
@@ -1427,7 +1374,8 @@ def _stream_response(
                 "padding:10px 12px;margin-bottom:8px;box-shadow:0 4px 14px rgba(22,163,74,.05)'>"
                 f"<div style='font-size:.8em;font-weight:700;color:#166534;margin-bottom:4px'>{_escape_html(row.get('type','subagent'))}</div>"
                 f"<div style='font-size:.72em;color:#64748b;margin-bottom:6px'>{_escape_html(endpoint)}"
-                f"{f'<br>pid {pid}' if pid else ''} · {_escape_html(status)}</div>"
+                f"{f'<br>pid {pid}' if pid else ''}"
+                f"{f'<br>model { _escape_html(str(model)) }' if model else ''} · {_escape_html(status)}</div>"
                 f"<div style='font-size:.88em;color:#14532d;white-space:pre-wrap;max-height:180px;overflow-y:auto'>{_escape_bubble_html(str(content))}</div>"
                 "</div>"
             )
@@ -1606,6 +1554,24 @@ def _stream_response(
         if refresh:
             _refresh(True)
 
+    def _log_subagent_status_once(row: dict, status: str, detail: str = "", *, icon: str = "📍", css: str = "subagent") -> None:
+        task_key = str(row.get("task_id", "") or row.get("id", "") or row.get("type", "subagent"))
+        key = (task_key, status)
+        if key in logged_status_keys:
+            return
+        logged_status_keys.add(key)
+        role = _escape_html(str(row.get("type", "subagent")))
+        endpoint = _escape_html(str(row.get("endpoint", "") or ""))
+        pid = row.get("pid")
+        meta_parts = []
+        if endpoint:
+            meta_parts.append(endpoint)
+        if pid:
+            meta_parts.append(f"pid {pid}")
+        meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
+        suffix = f" — {_escape_html(detail)}" if detail else ""
+        _evt(icon, f"{role} -> <b>{status}</b>{meta}{suffix}", css, refresh=False)
+
     def _track_spawn(agent_type: str, description: str) -> int:
         """Record a SubAgent spawn locally. Returns the index."""
         endpoint = ""
@@ -1647,6 +1613,7 @@ def _stream_response(
             description[:120],
             flush=True,
         )
+        _log_subagent_status_once(tracked_agents[idx], "created", description[:120], icon="🆕")
         return idx
 
     def _set_task_identity(idx: int | None, task_id: str = "", run_id: str = "") -> None:
@@ -1656,6 +1623,13 @@ def _stream_response(
             tracked_agents[idx]["task_id"] = task_id
         if run_id:
             tracked_agents[idx]["run_id"] = run_id
+        if task_id or run_id:
+            ident = []
+            if task_id:
+                ident.append(f"task_id {task_id[:12]}...")
+            if run_id:
+                ident.append(f"run_id {run_id[:12]}...")
+            _evt("🪪", f"{_escape_html(tracked_agents[idx]['type'])} identity bound: {' / '.join(ident)}", "subagent", refresh=False)
 
     def _set_task_action(idx: int | None, action: str, query: str | None = None) -> None:
         if idx is None or idx < 0 or idx >= len(tracked_agents):
@@ -1663,6 +1637,7 @@ def _stream_response(
         tracked_agents[idx]["last_action"] = action
         if query:
             tracked_agents[idx]["query"] = query
+        _evt("📝", f"{_escape_html(tracked_agents[idx]['type'])} action -> <b>{_escape_html(action)}</b>", "subagent", refresh=False)
 
     def _find_tracked_by_task_id(task_id: str) -> int | None:
         if not task_id:
@@ -1685,12 +1660,16 @@ def _stream_response(
                 continue
             if status in {"success", "completed"}:
                 tracked_agents[idx]["status"] = "completed"
+                _log_subagent_status_once(tracked_agents[idx], "completed", "tracker reported completion", icon="✅")
             elif status in {"error", "failed"}:
                 tracked_agents[idx]["status"] = "failed"
+                _log_subagent_status_once(tracked_agents[idx], "failed", str(row.get("error", "") or "tracker reported failure"), icon="❌", css="error")
             elif status == "cancelled":
                 tracked_agents[idx]["status"] = "cancelled"
+                _log_subagent_status_once(tracked_agents[idx], "cancelled", "tracker reported cancellation", icon="🛑", css="error")
             else:
                 tracked_agents[idx]["status"] = "running"
+                _log_subagent_status_once(tracked_agents[idx], "running", "tracker confirms task is running", icon="🏃")
         return rows
 
     def _poll_subagent_outputs() -> None:
@@ -1734,16 +1713,20 @@ def _stream_response(
                         if status in {"success", "completed"}:
                             row["status"] = "completed"
                             row["last_progress_at"] = time.time()
+                            _log_subagent_status_once(row, "completed", "run endpoint returned success", icon="✅")
                         elif status in {"error", "failed"}:
                             row["status"] = "failed"
                             row["last_progress_at"] = time.time()
                             subagent_runtime.update_task_state(task_id=task_id, state="failed", detail=str(data.get("error", "") or "run failed"), run_id=run_id)
+                            _log_subagent_status_once(row, "failed", str(data.get("error", "") or "run endpoint returned failure"), icon="❌", css="error")
                         elif status == "cancelled":
                             row["status"] = "cancelled"
                             row["last_progress_at"] = time.time()
                             subagent_runtime.update_task_state(task_id=task_id, state="cancelled", detail="run cancelled", run_id=run_id)
+                            _log_subagent_status_once(row, "cancelled", "run endpoint returned cancellation", icon="🛑", css="error")
                         elif status:
                             row["status"] = "running"
+                            _log_subagent_status_once(row, "running", "run endpoint is active", icon="🏃")
                 if row.get("status") == "completed":
                     thread_resp = httpx.get(
                         f"{url}/threads/{task_id}",
@@ -1759,6 +1742,7 @@ def _stream_response(
                                 row["live_output"] = final_output
                                 row["last_progress_at"] = time.time()
                                 changed = True
+                                _evt("📬", f"{_escape_html(agent_type)} final result captured ({len(final_output):,} chars)", "subagent", refresh=False)
             except Exception:
                 continue
             if row.get("status") == "running" and runtime_status not in {"running", "inprocess"}:
@@ -1781,17 +1765,13 @@ def _stream_response(
             _refresh(True, result=final_text, model=current_model)
 
     def _unfinished_async_tasks() -> list[dict]:
-        rows = _sync_async_tasks_from_tracker()
+        _sync_async_tasks_from_tracker()
         unfinished: list[dict] = []
-        for row in rows:
-            task_id = str(row.get("task_id", "") or "")
-            idx = _find_tracked_by_task_id(task_id)
-            if idx is not None:
-                local_status = str(tracked_agents[idx].get("status", "")).lower()
-                if local_status in {"blocked", "completed", "failed", "cancelled"}:
-                    continue
-            if str(row.get("status", "")).lower() not in {"success", "completed", "error", "failed", "cancelled"}:
-                unfinished.append(row)
+        for row in tracked_agents:
+            local_status = str(row.get("status", "")).lower()
+            if local_status in {"completed", "failed", "cancelled"}:
+                continue
+            unfinished.append(row)
         return unfinished
 
     def _maybe_schedule_alternate_subagent() -> bool:
@@ -2042,14 +2022,8 @@ def _stream_response(
                 "num_agents": len(inv_agents),
                 "async_task_snapshot": _capture_async_tasks(),
                 "subagent_history_snapshot": subagent_history_snapshot,
+                "aggregated_subagent_report": _build_completed_subagent_report(inv_agents),
                 "test_prompt_label": prompt_label,
-                "requirement_checklist": _build_requirement_checklist(
-                    prompt_label,
-                    final_text or "",
-                    list(tools_used),
-                    _capture_async_tasks(),
-                    [(e["icon"], e["text"]) for e in events],
-                ),
             })
             _finalize_and_rerun()
             return True
@@ -2425,10 +2399,9 @@ def _stream_response(
                 "subagent",
                 refresh=False,
             )
-        wait_rounds = 0
         unfinished = _unfinished_async_tasks()
         last_wait_count = -1
-        while unfinished and wait_rounds < 240:
+        while unfinished:
             if _is_refresh_requested():
                 _record_loop("stopped", "refresh_requested", next_action="user_refresh", policy_type="safe_stop")
                 _evt("🛑", "Refresh requested — stopping current run", "error", refresh=False)
@@ -2447,35 +2420,35 @@ def _stream_response(
                     "subagent",
                     refresh=False,
                 )
+                for row in unfinished:
+                    task_fragment = ""
+                    if row.get("task_id"):
+                        task_fragment = f", task_id={_escape_html(str(row.get('task_id', ''))[:12])}..."
+                    _evt(
+                        "🔎",
+                        f"Pending {_escape_html(str(row.get('type', 'subagent')))}: "
+                        f"status={_escape_html(str(row.get('status', 'running')))}{task_fragment}",
+                        "subagent",
+                        refresh=False,
+                    )
                 last_wait_count = len(unfinished)
             _poll_subagent_outputs()
             _maybe_schedule_alternate_subagent()
             _render_agent_status("Waiting for async subagents to finish...")
             time.sleep(SUBAGENT_POLL_INTERVAL_SECONDS)
-            wait_rounds += 1
             unfinished = _unfinished_async_tasks()
-
-        if unfinished:
-            _evt(
-                "⚠️",
-                f"Timed out waiting for {len(unfinished)} async task(s); returning the latest available result",
-                "error",
-                refresh=False,
-            )
-            _record_loop(
-                "degraded",
-                "async_wait_timeout",
-                failure_reason=f"{len(unfinished)} unfinished async tasks",
-                next_action="return_latest",
-                policy_type="subagent_failure",
-            )
 
         if had_async_subagents and not unfinished:
             _evt("🧩", "All async subagents finished. Collecting results into one final answer", "subagent", refresh=False)
             _render_agent_status("Collecting completed async task results...")
+            completed_report = _build_completed_subagent_report(tracked_agents)
+            _evt("📦", "Completed SubAgent results prepared for Main Agent aggregation", "subagent", refresh=False)
+            _evt("🧾", f"Aggregation ledger size: {len(completed_report):,} chars", "subagent", refresh=False)
             followup = (
                 "All async subagent tasks from this user turn should now be finished. "
-                "Collect every completed result using live async task tools if needed, "
+                "Below is the completed SubAgent result ledger gathered by the WebUI runtime. "
+                "Use it as the primary aggregation source, and use live async task tools only if you need to verify details.\n\n"
+                f"{completed_report}\n\n"
                 "then produce one final synthesized answer for the user. "
                 "Do not launch new async tasks unless absolutely required."
             )
@@ -2588,14 +2561,8 @@ def _stream_response(
             "num_agents": len(err_agents),
             "async_task_snapshot": _capture_async_tasks(),
             "subagent_history_snapshot": _capture_subagent_history_snapshot(err_agents, state_store),
+            "aggregated_subagent_report": _build_completed_subagent_report(err_agents),
             "test_prompt_label": st.session_state.get("_active_test_prompt_label"),
-            "requirement_checklist": _build_requirement_checklist(
-                st.session_state.get("_active_test_prompt_label"),
-                f"Error: {e}",
-                [],
-                _capture_async_tasks(),
-                [(ev["icon"], ev["text"]) for ev in events],
-            ),
         })
         st.session_state["_is_running"] = False
         st.session_state["_has_result"] = True
@@ -2788,10 +2755,19 @@ def render_chat() -> None:
                         False,
                         tooltips=msg.get("mermaid_tooltips", {}),
                     )
-                    _h = max(350, 220 + msg.get("num_agents", 0) * 70)
+                    _h = max(560, 340 + msg.get("num_agents", 0) * 90 + min(len(msg.get("mermaid_events", [])), 24) * 12)
                     with st.expander("🔍 Agent 동작 분석", expanded=_is_latest_assistant):
-                        components.html(_hist_html, height=_h, scrolling=False)
+                        components.html(_hist_html, height=_h, scrolling=True)
                         _history = msg.get("subagent_history_snapshot") or []
+                        aggregated_report = str(msg.get("aggregated_subagent_report", "") or "").strip()
+                        if aggregated_report and aggregated_report != "No completed SubAgent results were captured.":
+                            st.markdown(
+                                "<div style='background:#fff;border:1px solid #cbd5e1;border-radius:12px;padding:10px 12px;margin:8px 0'>"
+                                "<div style='font-size:.78em;font-weight:700;color:#334155;margin-bottom:6px'>Main Agent Aggregation Input</div>"
+                                f"<div style='font-size:.82em;color:#475569;white-space:pre-wrap'>{_escape_bubble_html(aggregated_report)}</div>"
+                                "</div>",
+                                unsafe_allow_html=True,
+                            )
                         if _history:
                             st.caption(f"Tracked subagents at completion: {len(_history)}")
                             for _row in _history[:6]:
@@ -2817,13 +2793,6 @@ def render_chat() -> None:
                                     "</div>",
                                     unsafe_allow_html=True,
                                 )
-
-                checklist = msg.get("requirement_checklist") or []
-                prompt_label = msg.get("test_prompt_label")
-                if prompt_label and checklist:
-                    with st.expander(f"Requirements Checklist · {prompt_label}", expanded=_is_latest_assistant):
-                        for item, ok in checklist:
-                            st.markdown(f"{'✅' if ok else '⬜'} {item}")
 
                 st.markdown(
                     f"<div class='user-bubble-label'>👤 User</div>"

@@ -436,6 +436,48 @@ export DEEPAGENTS_DEPLOYMENT_TOPOLOGY=split
 python -m coding_agent
 ```
 
+### Docker Compose 실행
+
+이 저장소에는 바로 실행 가능한 `Dockerfile`과 `docker-compose.yml`이 포함되어 있습니다.
+
+기본 정책:
+
+- 이미지 내부 애플리케이션 코드는 `/opt/app`
+- 실제 작업 디렉터리와 SubAgent 파일 작업 경로는 `/workspace`
+- 장기 메모리는 `/data/memory`
+- durable state는 `/data/state`
+- `.deepagents` 설정과 상태는 `/root/.deepagents`
+
+처음 실행:
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+브라우저:
+
+- `http://localhost:8501`
+
+선택 사항:
+
+- Ollama까지 같이 띄우려면:
+
+```bash
+docker compose --profile with-ollama up --build
+```
+
+다른 PC에서 실행할 때 필요한 것은 기본적으로 3개입니다.
+
+1. Docker / Docker Compose
+2. `.env`에 들어갈 `OPENROUTER_API_KEY`
+3. 작업 결과를 받을 `./workspace` 디렉터리
+
+중요:
+
+- Docker 실행 시 Main Agent와 SubAgent의 현재 작업 디렉터리는 `/workspace`입니다.
+- 따라서 에이전트가 생성/수정한 파일은 호스트의 `./workspace`에 나타납니다.
+
 ## 주요 환경 변수
 
 | Variable | Description | Default |
@@ -450,6 +492,8 @@ python -m coding_agent
 | `ASYNC_SUBAGENT_BASE_PORT` | base port for subagents | `30240` |
 | `MEMORY_DIR` | semantic memory storage path | `~/.coding_agent/memory` |
 | `STATE_DIR` | durable SQLite state path | `~/.coding_agent/state` |
+| `CODING_AGENT_PORT` | compose-exposed Streamlit port | `8501` |
+| `CODING_AGENT_IMAGE` | Docker image name used by compose | `leesk212/coding-ai-agent-v2:latest` |
 
 ## 테스트
 
