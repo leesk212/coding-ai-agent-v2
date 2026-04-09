@@ -451,7 +451,6 @@ python -m coding_agent
 처음 실행:
 
 ```bash
-cp .env.example .env
 docker compose up --build
 ```
 
@@ -470,8 +469,14 @@ docker compose --profile with-ollama up --build
 다른 PC에서 실행할 때 필요한 것은 기본적으로 3개입니다.
 
 1. Docker / Docker Compose
-2. `.env`에 들어갈 `OPENROUTER_API_KEY`
+2. OpenRouter API key
 3. 작업 결과를 받을 `./workspace` 디렉터리
+
+`.env` 파일은 필수가 아닙니다.
+
+- `docker compose`는 `.env` 없이도 실행됩니다.
+- OpenRouter API key는 실행 후 WebUI 시작 화면에서 직접 입력할 수 있습니다.
+- 필요하면 쉘 환경변수로 넘겨도 됩니다. 예: `OPENROUTER_API_KEY=... docker compose up`
 
 중요:
 
@@ -493,7 +498,7 @@ docker compose --profile with-ollama up --build
 | `MEMORY_DIR` | semantic memory storage path | `~/.coding_agent/memory` |
 | `STATE_DIR` | durable SQLite state path | `~/.coding_agent/state` |
 | `CODING_AGENT_PORT` | compose-exposed Streamlit port | `8501` |
-| `CODING_AGENT_IMAGE` | Docker image name used by compose | `leesk212/coding-ai-agent-v2:latest` |
+| `CODING_AGENT_IMAGE` | Docker image name used by compose | `leesk212/coding-ai-agent-v4:latest` |
 
 ## 테스트
 

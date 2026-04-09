@@ -1,8 +1,8 @@
-"""Model Fallback Middleware - OpenRouter -> Local LLM with Circuit Breaker.
+"""Model Fallback Middleware - OpenRouter -> fallback with Circuit Breaker.
 
 Extends DeepAgents' AgentMiddleware to automatically fall back through a
-priority list of open-source models when the current model fails or times out.
-The last resort is always a local Ollama model.
+    priority list of open-source models when the current model fails or times out.
+    The last resort is a configured fallback model.
 
 Uses the real langchain AgentMiddleware interface:
   - wrap_model_call / awrap_model_call: intercept LLM calls with fallback logic
@@ -80,6 +80,14 @@ def create_model(spec: ModelSpec) -> BaseChatModel:
                 "HTTP-Referer": "https://github.com/coding-ai-agent",
                 "X-Title": "CodingAIAgent",
             },
+            timeout=settings.model_timeout,
+        )
+    elif spec.provider == "openai":
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=spec.name,
+            api_key=settings.openai_api_key,
             timeout=settings.model_timeout,
         )
     elif spec.provider == "ollama":

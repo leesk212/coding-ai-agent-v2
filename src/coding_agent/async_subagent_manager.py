@@ -48,11 +48,59 @@ DEFAULT_ASYNC_SUBAGENTS: dict[str, dict[str, Any]] = {
         "graph_id": "coder",
         "transport": "http",
     },
+    "frontend": {
+        "description": "Frontend agent for web/mobile UI, UX flows, and client-side implementation.",
+        "system_prompt": (
+            "You are a frontend specialist. Focus on UI flows, component structure, responsive design, "
+            "web/mobile interaction details, and client-side implementation. Be explicit about screens, "
+            "state transitions, and user interaction behavior."
+        ),
+        "graph_id": "frontend",
+        "transport": "http",
+    },
+    "backend": {
+        "description": "Backend agent for APIs, domain logic, data model, persistence, and integrations.",
+        "system_prompt": (
+            "You are a backend specialist. Focus on data modeling, service boundaries, APIs, persistence, "
+            "permissions, scheduling, and business logic. Be concrete about schemas, endpoints, and state transitions."
+        ),
+        "graph_id": "backend",
+        "transport": "http",
+    },
+    "planner": {
+        "description": "Planning agent for PRD decomposition, work breakdown, milestones, and execution sequencing.",
+        "system_prompt": (
+            "You are a planning specialist. Turn requirements into concrete PRD sections, atomic work items, "
+            "milestones, acceptance criteria, dependencies, and execution order. Avoid vague wording."
+        ),
+        "graph_id": "planner",
+        "transport": "http",
+    },
+    "architect": {
+        "description": "Architecture agent for system design, module boundaries, technical decisions, and spec structure.",
+        "system_prompt": (
+            "You are a software architect. Define system boundaries, module responsibilities, interfaces, "
+            "data flow, deployment shape, and technical tradeoffs in a spec-driven way."
+        ),
+        "graph_id": "architect",
+        "transport": "http",
+    },
+    "mobile": {
+        "description": "Mobile agent for app flows, cross-platform mobile UX, and mobile implementation concerns.",
+        "system_prompt": (
+            "You are a mobile specialist. Focus on mobile navigation, screens, responsive behavior, offline states, "
+            "device constraints, and cross-platform implementation details."
+        ),
+        "graph_id": "mobile",
+        "transport": "http",
+    },
     "reviewer": {
         "description": "Review agent for correctness, regressions, and missing tests.",
         "system_prompt": (
             "You are a code review specialist. Focus on bugs, behavior regressions, and missing "
-            "coverage. Be concrete and prioritize the highest-risk findings first."
+            "coverage. Be concrete and prioritize the highest-risk findings first. "
+            "If the task is to review code produced in the same user turn, inspect the current "
+            "working directory for the relevant file first and only ask for a path if no artifact exists."
         ),
         "graph_id": "reviewer",
         "transport": "http",

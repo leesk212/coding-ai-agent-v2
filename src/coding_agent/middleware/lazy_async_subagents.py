@@ -37,6 +37,16 @@ class LazyAsyncSubagentsMiddleware(AgentMiddleware):
             return None
 
         task_summary = str(args.get("description", "") or "").strip()
+        root_dir = str(self._runtime.root_dir)
+        if task_summary:
+            args["description"] = (
+                f"{task_summary}\n\n"
+                "Runtime context:\n"
+                f"- Working directory: {root_dir}\n"
+                f"- Use absolute paths rooted under {root_dir}\n"
+                "- If you create or review files, inspect this directory first.\n"
+            )
+            task_summary = str(args["description"])
         self._runtime.begin_task(subagent_type, task_summary or "(no task summary)")
         try:
             self._runtime.ensure_started(subagent_type)

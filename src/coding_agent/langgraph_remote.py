@@ -157,6 +157,7 @@ def create_remote_coding_agent(
     return {
         "agent": agent,
         "backend": None,
+        "working_dir": str(cwd),
         "fallback_middleware": fallback,
         "memory_middleware": RemoteMemoryFacade(str(cfg.memory_dir)),
         "subagent_middleware": runtime,

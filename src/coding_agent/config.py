@@ -1,6 +1,7 @@
 """Configuration management for the Coding AI Agent.
 
-Uses OpenRouter open-source models as primary, with Ollama local fallback.
+Uses OpenRouter open-source models as primary, with optional Ollama or OpenAI
+fallback.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ class ModelSpec:
     """Specification for an LLM model."""
 
     name: str
-    provider: str  # "openrouter" or "ollama"
+    provider: str  # "openrouter", "ollama", or "openai"
     priority: int  # lower = preferred
 
     def __hash__(self) -> int:
@@ -31,6 +32,8 @@ class ModelSpec:
             return f"openrouter:{self.name}"
         elif self.provider == "ollama":
             return f"ollama:{self.name}"
+        elif self.provider == "openai":
+            return f"openai:{self.name}"
         return self.name
 
 
@@ -51,6 +54,12 @@ DEFAULT_LOCAL_MODEL = ModelSpec(
     priority=99,
 )
 
+DEFAULT_OPENAI_FALLBACK_MODEL = ModelSpec(
+    name=os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4o-mini"),
+    provider="openai",
+    priority=99,
+)
+
 
 @dataclass
 class Settings:
@@ -59,6 +68,9 @@ class Settings:
     # API Keys
     openrouter_api_key: str = field(
         default_factory=lambda: os.getenv("OPENROUTER_API_KEY", "")
+    )
+    openai_api_key: str = field(
+        default_factory=lambda: os.getenv("OPENAI_API_KEY", "")
     )
 
     # Ollama
@@ -69,6 +81,10 @@ class Settings:
     # Model configuration
     model_priority: list[ModelSpec] = field(default_factory=lambda: list(DEFAULT_MODELS))
     local_fallback_model: ModelSpec = field(default_factory=lambda: DEFAULT_LOCAL_MODEL)
+    openai_fallback_model: ModelSpec = field(default_factory=lambda: DEFAULT_OPENAI_FALLBACK_MODEL)
+    fallback_mode: str = field(
+        default_factory=lambda: os.getenv("FALLBACK_MODE", "local")
+    )
 
     # Memory
     memory_dir: Path = field(
@@ -84,7 +100,7 @@ class Settings:
 
     # Sub-agents
     max_subagents: int = field(
-        default_factory=lambda: int(os.getenv("MAX_SUBAGENTS", "3"))
+        default_factory=lambda: int(os.getenv("MAX_SUBAGENTS", "100"))
     )
     deployment_topology: str = field(
         default_factory=lambda: os.getenv("DEEPAGENTS_DEPLOYMENT_TOPOLOGY", "split")
@@ -103,7 +119,9 @@ class Settings:
     )
 
     # Agentic loop
-    max_iterations: int = 25
+    max_iterations: int = field(
+        default_factory=lambda: int(os.getenv("MAX_ITERATIONS", "10000"))
+    )
     model_timeout: float = 60.0
     circuit_breaker_threshold: int = 3
     circuit_breaker_reset: float = 300.0  # 5 minutes
@@ -112,19 +130,30 @@ class Settings:
     def has_openrouter(self) -> bool:
         return bool(self.openrouter_api_key)
 
+    @property
+    def selected_fallback_model(self) -> ModelSpec | None:
+        mode = (self.fallback_mode or "local").strip().lower()
+        if mode == "none":
+            return None
+        if mode == "openai":
+            return self.openai_fallback_model
+        return self.local_fallback_model
+
     def get_all_models(self) -> list[ModelSpec]:
         """Return all models in priority order, including local fallback."""
-        return sorted(
-            self.model_priority + [self.local_fallback_model],
-            key=lambda m: m.priority,
-        )
+        models = list(self.model_priority)
+        fallback_model = self.selected_fallback_model
+        if fallback_model is not None:
+            models.append(fallback_model)
+        return sorted(models, key=lambda m: m.priority)
 
     @property
     def primary_model_string(self) -> str:
         """Get the primary model as a DeepAgents CLI model string."""
         if self.model_priority:
             return self.model_priority[0].to_model_string()
-        return self.local_fallback_model.to_model_string()
+        fallback_model = self.selected_fallback_model or self.local_fallback_model
+        return fallback_model.to_model_string()
 
 
 # Global settings instance

@@ -21,6 +21,11 @@ class AsyncSubagentManagerTests(unittest.TestCase):
         names = {spec["name"] for spec in specs}
         self.assertIn("researcher", names)
         self.assertIn("coder", names)
+        self.assertIn("frontend", names)
+        self.assertIn("backend", names)
+        self.assertIn("planner", names)
+        self.assertIn("architect", names)
+        self.assertIn("mobile", names)
 
         researcher = next(spec for spec in specs if spec["name"] == "researcher")
         self.assertEqual(researcher["graph_id"], "researcher")

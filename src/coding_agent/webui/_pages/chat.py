@@ -23,19 +23,23 @@ import threading
 import time
 import traceback
 import uuid
+from pathlib import Path
 
 import httpx
 import streamlit as st
 import streamlit.components.v1 as components
 from langchain_core.messages import HumanMessage
 
+from coding_agent.config import settings
 from coding_agent.resilience import get_policy
+from coding_agent.runtime import create_runtime_components
 
 logger = logging.getLogger(__name__)
 
 AGENT_ICONS = {
     "coder": "✍️", "code_writer": "✍️", "researcher": "🔍", "reviewer": "📋",
-    "debugger": "🐛", "general": "🤖",
+    "debugger": "🐛", "frontend": "🖥️", "backend": "🗄️", "planner": "🗂️",
+    "architect": "🏗️", "mobile": "📱", "general": "🤖",
 }
 
 TEST_PROMPTS = {
@@ -59,18 +63,21 @@ TEST_PROMPTS = {
         "이제 Silver는 환불 수수료 5%로 바뀌었다고 정정하고, 정정 전/후 차이를 요약해라."
     ),
     "SubAgent Lifecycle": (
-        "동적 SubAgent 수명주기 테스트다. 하나의 사용자 질의 안에서 researcher subagent와 coder subagent를 "
+        "동적 SubAgent 수명주기 테스트다. 이 요청은 반드시 async subagent를 사용해야 한다. "
+        "하나의 사용자 질의 안에서 researcher subagent와 coder subagent를 `start_async_task`로 "
         "동적으로 생성해서 실행하고, 완료될 때까지 기다린 뒤, 각 subagent의 상태 전이 "
         "created -> assigned -> running -> completed/destroyed 를 요약해라."
     ),
     "Code+Review Test": (
-        "Handle this in one user turn. Launch two async tasks: "
-        "1) a coder subagent to implement a fibonacci function with type hints, "
-        "2) a reviewer subagent to review correctness, edge cases, and missing tests. "
-        "Wait for both to finish, collect the completed results in the same response, and synthesize one final answer."
+        "Handle this in one user turn. You must use async subagents via `start_async_task`. "
+        "First launch a coder subagent to implement a fibonacci function "
+        "with type hints and save it to a concrete Python file in the current query workspace. "
+        "After the coder completes and the file path is known, launch a reviewer subagent to review "
+        "that exact file for correctness, edge cases, and missing tests. Wait for both to finish, "
+        "collect the completed results in the same response, and synthesize one final answer."
     ),
     "Blocked/Failed": (
-        "SubAgent 예외 처리 테스트다. 일부러 모호한 작업을 coder subagent에 맡기고, "
+        "SubAgent 예외 처리 테스트다. 이 요청은 반드시 async subagent를 사용해야 한다. 일부러 모호한 작업을 coder subagent에 맡기고, "
         "blocked 또는 failed 상태가 감지되면 대체 경로를 사용해라. "
         "최종적으로 어떤 상태 전이가 있었는지와 어떤 대체 역할을 사용했는지 요약해라."
     ),
@@ -102,11 +109,60 @@ SUBAGENT_POLL_INTERVAL_SECONDS = 0.25
 SUBAGENT_RUN_POLL_TIMEOUT_SECONDS = 0.2
 ALTERNATE_ROLE_POLICY = {
     "coder": "debugger",
+    "frontend": "reviewer",
+    "backend": "reviewer",
+    "planner": "architect",
+    "architect": "reviewer",
+    "mobile": "reviewer",
     "debugger": "reviewer",
     "researcher": "reviewer",
     "reviewer": "coder",
     "general": "reviewer",
 }
+
+
+def _create_query_workdir(root: Path | None = None) -> Path:
+    """Create a per-query working directory rooted under the current project root."""
+    base_root = (root or Path.cwd()).resolve()
+    sessions_root = base_root / "query_sessions"
+    sessions_root.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    candidate = sessions_root / stamp
+    suffix = 1
+    while candidate.exists():
+        suffix += 1
+        candidate = sessions_root / f"{stamp}_{suffix:02d}"
+    candidate.mkdir(parents=True, exist_ok=False)
+    return candidate
+
+
+def _shutdown_runtime_components(components_obj) -> None:
+    if not components_obj:
+        return
+    runtime = components_obj.get("subagent_runtime")
+    if runtime is not None and hasattr(runtime, "shutdown_all"):
+        try:
+            runtime.shutdown_all()
+        except Exception:
+            logger.exception("Failed to shutdown previous subagent runtime")
+
+
+def _prepare_query_runtime(workdir: Path):
+    """Rebuild runtime components so one user query executes inside one workdir."""
+    previous = st.session_state.get("agent_components")
+    prev_workdir = str((previous or {}).get("working_dir", "") or "")
+    workdir_str = str(workdir.resolve())
+    if previous and prev_workdir == workdir_str:
+        return previous
+
+    _shutdown_runtime_components(previous)
+    components_obj = create_runtime_components(
+        custom_settings=settings,
+        cwd=workdir,
+    )
+    st.session_state.agent_components = components_obj
+    st.session_state["_active_query_workdir"] = workdir_str
+    return components_obj
 
 
 # ─────────────────────────────────────────────────────────
@@ -943,7 +999,31 @@ def _resume_async_monitoring(
     def _sync_async_tasks_from_tracker() -> list[dict]:
         rows = _capture_async_tasks()
         for row in rows:
-            idx = _find_tracked_by_task_id(str(row.get("task_id", "") or ""))
+            task_id = str(row.get("task_id", "") or "")
+            idx = _find_tracked_by_task_id(task_id)
+            if idx is None:
+                tracked_agents.append(
+                    {
+                        "id": f"tracker_{task_id[:12] or len(tracked_agents)}",
+                        "type": str(row.get("agent_type", "general") or "general"),
+                        "status": "running",
+                        "last_action": "tracker",
+                        "elapsed": "",
+                        "query": "",
+                        "task_id": task_id,
+                        "run_id": str(row.get("run_id", "") or ""),
+                        "model": "",
+                        "started_at": time.time(),
+                        "endpoint": "",
+                        "pid": None,
+                        "live_output": "",
+                        "result_summary": "",
+                        "last_progress_at": time.time(),
+                        "alternate_attempted": False,
+                    }
+                )
+                idx = len(tracked_agents) - 1
+                _evt("🛰️", f"Tracker discovered async task for <b>{_escape_html(str(row.get('agent_type', 'general')))}</b>", "subagent")
             if idx is None:
                 continue
             local_status = str(tracked_agents[idx].get("status", "")).lower()
@@ -1200,6 +1280,7 @@ def _stream_response(
         return False
 
     agent = comp["agent"]
+    working_dir = str(comp.get("working_dir", "") or st.session_state.get("_active_query_workdir", "") or Path.cwd())
     fallback_mw = comp["fallback_middleware"]
     loop_guard = comp["loop_guard"]
     subagent_runtime = comp.get("subagent_runtime")
@@ -1650,9 +1731,15 @@ def _stream_response(
     def _sync_async_tasks_from_tracker() -> list[dict]:
         rows = _capture_async_tasks()
         for row in rows:
-            idx = _find_tracked_by_task_id(str(row.get("task_id", "")))
+            task_id = str(row.get("task_id", "") or "")
+            idx = _find_tracked_by_task_id(task_id)
             if idx is None:
-                continue
+                discovered_role = str(row.get("agent_type", "general") or "general")
+                idx = _track_spawn(discovered_role, f"tracker discovered async task {task_id[:12]}...")
+                tracked_agents[idx]["task_id"] = task_id
+                tracked_agents[idx]["run_id"] = str(row.get("run_id", "") or "")
+                tracked_agents[idx]["last_action"] = "tracker"
+                _evt("🛰️", f"Tracker discovered async task for <b>{_escape_html(discovered_role)}</b>", "subagent", refresh=False)
             local_status = str(tracked_agents[idx].get("status", "")).lower()
             tracked_agents[idx]["run_id"] = str(row.get("run_id", "") or tracked_agents[idx].get("run_id", ""))
             status = str(row.get("status", "")).lower()
@@ -1957,6 +2044,7 @@ def _stream_response(
         _record_loop("running", "start")
         _sync_live_turn_state(working=True)
         _evt("🚀", f"Prompt received ({len(prompt)} chars)", "tool")
+        _evt("📁", f"Query workspace: <b>{_escape_html(working_dir)}</b>", "tool", refresh=False)
 
         if not hasattr(agent, "stream"):
             _evt("⚠️", "Agent lacks .stream() — using non-streaming invoke", "tool")
@@ -2391,7 +2479,7 @@ def _stream_response(
                     current_model = fallback_mw.current_model
                 _drain_runtime_events(refresh=True)
 
-        had_async_subagents = bool(tracked_agents)
+        had_async_subagents = bool(tracked_agents) or bool(_capture_async_tasks())
         if stream_cutoff_for_async:
             _evt(
                 "⏳",
@@ -2912,17 +3000,44 @@ def render_chat() -> None:
 
     show_test_prompts = st.toggle("Test Prompt", key="_show_test_prompts", value=False)
     if show_test_prompts:
-        st.markdown("<div style='background:#fff;padding:2px 0 0'>", unsafe_allow_html=True)
-        for label, prompt_text in TEST_PROMPTS.items():
-            st.caption(TEST_PROMPT_DETAILS.get(label, ""))
-            if st.button(
-                label,
-                key=f"test_{label}",
-                use_container_width=True,
+        st.markdown(
+            "<div style='background:#fff;padding:4px 0 2px'>",
+            unsafe_allow_html=True,
+        )
+        labels = list(TEST_PROMPTS.keys())
+        pills_value = None
+        if hasattr(st, "pills"):
+            pills_value = st.pills(
+                "Test Prompt",
+                options=labels,
+                selection_mode="single",
+                label_visibility="collapsed",
                 disabled=is_running,
-            ):
-                st.session_state["_preset_prompt"] = prompt_text
-                st.session_state["_active_test_prompt_label"] = label
+                key="_test_prompt_pills",
+            )
+        else:
+            pills_value = st.radio(
+                "Test Prompt",
+                options=labels,
+                horizontal=True,
+                label_visibility="collapsed",
+                disabled=is_running,
+                key="_test_prompt_radio",
+            )
+
+        if pills_value:
+            st.caption(TEST_PROMPT_DETAILS.get(pills_value, ""))
+            apply_col, _ = st.columns([1, 8])
+            with apply_col:
+                use_clicked = st.button(
+                    "Use",
+                    key=f"use_test_prompt_{pills_value}",
+                    disabled=is_running,
+                    use_container_width=True,
+                )
+            if use_clicked:
+                st.session_state["_preset_prompt"] = TEST_PROMPTS[pills_value]
+                st.session_state["_active_test_prompt_label"] = pills_value
                 st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2967,6 +3082,10 @@ def render_chat() -> None:
         st.session_state["_refresh_requested"] = False
         st.session_state["_stop_requested"] = False
         st.session_state["_is_running"] = True
+        query_workdir = _create_query_workdir(Path.cwd())
+        st.session_state["_active_query_workdir"] = str(query_workdir)
+        st.session_state["_active_query_started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        st.session_state.agent_components = _prepare_query_runtime(query_workdir)
         completed = False
         try:
             completed = _stream_response(pending, graph_ph, result_ph_ref["ph"], subagent_ph_ref["ph"])

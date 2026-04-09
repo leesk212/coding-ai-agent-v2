@@ -38,11 +38,17 @@ BASE_SYSTEM_PROMPT = """You are Danny's Coding AI Agent, a software engineering 
 
 ## Async Subagent Workflow
 - Use `start_async_task` to launch background work when a task is large, parallelizable, or should continue while you reason.
+- If the user explicitly asks for subagents, lifecycle validation, async review, code+review, or parallel delegation, you must use `start_async_task` instead of solving the entire request alone.
+- For product-building requests with PRD, task breakdown, spec-driven development, TDD, web/mobile support, or clear frontend/backend separation, prefer splitting work across specialized subagents such as `planner`, `architect`, `researcher`, `frontend`, `backend`, `mobile`, and `reviewer`.
 - For normal "solve now" requests, keep working in the same turn until you collect relevant completed async task outputs and synthesize them.
 - Use `check_async_task` to collect results after launch. Only stop immediately after launch when the user explicitly asks for background execution.
 - Use `update_async_task` to change the instructions for an existing task.
 - Use `cancel_async_task` to stop work that is no longer needed.
 - Use `list_async_tasks` when you need a live overview of every active or completed subagent task.
+- Do not launch dependent subagents in parallel when one needs another's artifact.
+- Example: if `reviewer` must review code written by `coder`, wait until `coder` completes and you know the file path or code artifact before launching `reviewer`.
+- Example: for a project request like "build a Task PMS system with PRD, spec, web/mobile UX, gantt chart, and TDD", split PRD/work breakdown to `planner`, system design to `architect`, web UI to `frontend`, mobile UX to `mobile`, backend/data/APIs to `backend`, and final validation to `reviewer`.
+- When delegating implementation work, include the expected target file path in the subagent task description whenever possible.
 
 ## Aggregation Rules
 - When multiple subagents were launched, collect their latest results before synthesizing a final answer.
@@ -161,6 +167,24 @@ def create_coding_agent(
 ) -> dict[str, Any]:
     """Create the main supervisor with DeepAgents AsyncSubAgent specs."""
 
+    prewarmed = prewarm_coding_agent(
+        custom_settings=custom_settings,
+        cwd=cwd,
+        topology=topology,
+        progress_cb=progress_cb,
+    )
+    return finalize_coding_agent(prewarmed, progress_cb=progress_cb)
+
+
+def prewarm_coding_agent(
+    custom_settings: Settings | None = None,
+    cwd: Path | None = None,
+    *,
+    topology: str | None = None,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Prewarm everything except the final model-bound DeepAgents graph assembly."""
+
     cfg = custom_settings or settings
     working_dir = (cwd or Path.cwd()).resolve()
     if progress_cb:
@@ -220,18 +244,60 @@ def create_coding_agent(
         virtual_mode=False,
     )
 
+    return {
+        "backend": backend,
+        "working_dir": str(working_dir),
+        "cfg": cfg,
+        "system_prompt": system_prompt,
+        "tools": ltm_mw.get_tools(),
+        "memory_sources": _setup_agents_md(),
+        "fallback_middleware": fallback_mw,
+        "memory_middleware": ltm_mw,
+        "async_only_middleware": async_only_mw,
+        "lazy_async_middleware": lazy_async_mw,
+        "subagent_lifecycle_middleware": subagent_lifecycle_mw,
+        "completion_middleware": completion_mw,
+        "subagent_middleware": subagent_runtime,
+        "subagent_manager": subagent_runtime,
+        "subagent_runtime": subagent_runtime,
+        "state_store": subagent_runtime.state_store,
+        "deployment_topology": subagent_runtime.topology,
+        "async_subagents": async_subagents,
+        "loop_guard": loop_guard,
+        "checkpointer": checkpointer,
+        "prewarmed": True,
+    }
+
+
+def finalize_coding_agent(
+    prewarmed: dict[str, Any],
+    *,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Create the final DeepAgents graph from a prewarmed local runtime bundle."""
+
+    if progress_cb:
+        progress_cb("Binding model provider with current API key configuration")
+    fallback_mw = prewarmed["fallback_middleware"]
     if progress_cb:
         progress_cb("Assembling DeepAgents supervisor graph")
     agent = create_deep_agent(
         model=fallback_mw.get_model_with_fallback(),
-        system_prompt=system_prompt,
-        middleware=[fallback_mw, ltm_mw, async_only_mw, lazy_async_mw, subagent_lifecycle_mw, completion_mw],
-        tools=ltm_mw.get_tools(),
-        subagents=async_subagents,
-        memory=_setup_agents_md(),
+        system_prompt=prewarmed["system_prompt"],
+        middleware=[
+            fallback_mw,
+            prewarmed["memory_middleware"],
+            prewarmed["async_only_middleware"],
+            prewarmed["lazy_async_middleware"],
+            prewarmed["subagent_lifecycle_middleware"],
+            prewarmed["completion_middleware"],
+        ],
+        tools=prewarmed["tools"],
+        subagents=prewarmed["async_subagents"],
+        memory=prewarmed["memory_sources"],
         skills=[],
-        checkpointer=checkpointer,
-        backend=backend,
+        checkpointer=prewarmed["checkpointer"],
+        backend=prewarmed["backend"],
         debug=False,
         name="coding-ai-agent",
     )
@@ -240,21 +306,10 @@ def create_coding_agent(
 
     logger.info(
         "Created DeepAgents supervisor with %d AsyncSubAgent specs",
-        len(async_subagents),
+        len(prewarmed["async_subagents"]),
     )
 
-    return {
-        "agent": agent,
-        "backend": backend,
-        "fallback_middleware": fallback_mw,
-        "memory_middleware": ltm_mw,
-        "subagent_middleware": subagent_runtime,
-        "subagent_manager": subagent_runtime,
-        "subagent_runtime": subagent_runtime,
-        "state_store": subagent_runtime.state_store,
-        "deployment_topology": subagent_runtime.topology,
-        "async_subagents": async_subagents,
-        "async_task_tracker": AsyncTaskTracker(agent),
-        "loop_guard": loop_guard,
-        "checkpointer": checkpointer,
-    }
+    components = dict(prewarmed)
+    components["agent"] = agent
+    components["async_task_tracker"] = AsyncTaskTracker(agent)
+    return components

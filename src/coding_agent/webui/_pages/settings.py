@@ -23,6 +23,17 @@ def render_settings() -> None:
         os.environ["OPENROUTER_API_KEY"] = openrouter_key
         st.success("OpenRouter API key updated!")
 
+    openai_key = st.text_input(
+        "OpenAI API Key",
+        value=settings.openai_api_key or "",
+        type="password",
+        help="Optional. Used only when fallback mode is set to OpenAI.",
+    )
+    if openai_key != settings.openai_api_key:
+        settings.openai_api_key = openai_key
+        os.environ["OPENAI_API_KEY"] = openai_key
+        st.success("OpenAI API key updated!")
+
     st.markdown("---")
 
     # Model Configuration
@@ -37,7 +48,24 @@ def render_settings() -> None:
         col1.text(f"{i+1}. {model.name}")
         col2.text(model.provider)
 
-    st.markdown(f"**Fallback:** {settings.local_fallback_model.name} (Ollama local)")
+    fallback_mode = st.selectbox(
+        "Fallback Mode",
+        options=["none", "local", "openai"],
+        index=["none", "local", "openai"].index(
+            settings.fallback_mode if settings.fallback_mode in {"none", "local", "openai"} else "local"
+        ),
+        help="Choose the last-resort model path used when OpenRouter models fail.",
+    )
+    if fallback_mode != settings.fallback_mode:
+        settings.fallback_mode = fallback_mode
+        os.environ["FALLBACK_MODE"] = fallback_mode
+
+    selected_fallback = settings.selected_fallback_model
+    if selected_fallback is None:
+        st.markdown("**Fallback:** disabled")
+    else:
+        label = "Ollama local" if selected_fallback.provider == "ollama" else "OpenAI"
+        st.markdown(f"**Fallback:** {selected_fallback.name} ({label})")
 
     st.markdown("---")
 
@@ -61,6 +89,18 @@ def render_settings() -> None:
         settings.local_fallback_model = ModelSpec(
             name=local_model,
             provider="ollama",
+            priority=99,
+        )
+
+    openai_model = st.text_input(
+        "OpenAI Fallback Model",
+        value=settings.openai_fallback_model.name,
+        help="OpenAI model name used when fallback mode is OpenAI.",
+    )
+    if openai_model != settings.openai_fallback_model.name:
+        settings.openai_fallback_model = ModelSpec(
+            name=openai_model,
+            provider="openai",
             priority=99,
         )
 
@@ -137,7 +177,7 @@ def render_settings() -> None:
         max_iter = st.number_input(
             "Max Iterations",
             min_value=5,
-            max_value=100,
+            max_value=100000,
             value=settings.max_iterations,
             help="Maximum agent loop iterations before stopping",
         )
@@ -147,7 +187,7 @@ def render_settings() -> None:
         max_sa = st.number_input(
             "Max Concurrent SubAgents",
             min_value=1,
-            max_value=10,
+            max_value=100,
             value=settings.max_subagents,
             help="Maximum number of sub-agents running at once",
         )
@@ -225,6 +265,7 @@ def render_settings() -> None:
             fallback = components["fallback_middleware"]
             status = fallback.get_status()
             st.caption(f"Topology: `{components.get('deployment_topology', settings.deployment_topology)}`")
+            st.caption(f"Fallback mode: `{settings.fallback_mode}`")
 
             for m in status["models"]:
                 icon = (
