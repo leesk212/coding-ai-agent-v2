@@ -29,7 +29,14 @@ class AsyncSubagentServerTests(unittest.TestCase):
         )
 
     def _make_client(self) -> TestClient:
-        fake_agent = SimpleNamespace(ainvoke=AsyncMock(return_value=FAKE_RESPONSE))
+        async def fake_astream(*_args, **_kwargs):
+            yield (AIMessage(content="Here "), {})
+            yield (AIMessage(content="are the coding results."), {})
+
+        fake_agent = SimpleNamespace(
+            ainvoke=AsyncMock(return_value=FAKE_RESPONSE),
+            astream=fake_astream,
+        )
         patcher = patch.object(server, "_bootstrap_agent", return_value=fake_agent)
         self.addCleanup(patcher.stop)
         patcher.start()
@@ -68,6 +75,7 @@ class AsyncSubagentServerTests(unittest.TestCase):
             status_resp = client.get(f"/threads/{thread_id}/runs/{run_id}")
             self.assertEqual(status_resp.status_code, 200)
             self.assertEqual(status_resp.json()["status"], "success")
+            self.assertEqual(status_resp.json()["partial_output"], "Here are the coding results.")
 
             thread_resp = client.get(f"/threads/{thread_id}")
             self.assertEqual(thread_resp.status_code, 200)

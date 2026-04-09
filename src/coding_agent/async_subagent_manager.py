@@ -190,7 +190,24 @@ class LocalAsyncSubagentManager:
         loaded = load_async_subagents()
         self._subagents = self._merge_subagents(DEFAULT_ASYNC_SUBAGENTS, loaded, subagents or {})
         self._processes: dict[str, LocalAsyncSubagentProcess] = {}
+        self._events: list[dict[str, Any]] = []
         self._shutdown_registered = False
+
+    def _emit_event(self, event_type: str, spec: LocalAsyncSubagentProcess, **extra: Any) -> None:
+        self._events.append(
+            {
+                "type": event_type,
+                "name": spec.name,
+                "graph_id": spec.graph_id,
+                "transport": spec.transport,
+                "host": spec.host,
+                "port": spec.port,
+                "url": spec.url,
+                "pid": spec.pid,
+                "time": time.time(),
+                **extra,
+            }
+        )
 
     @staticmethod
     def _merge_subagents(*sources: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -303,6 +320,7 @@ class LocalAsyncSubagentManager:
         )
         spec.started_at = time.time()
         spec.last_error = None
+        self._emit_event("spawned", spec)
         self._register_shutdown()
 
     def _wait_until_healthy(self, spec: LocalAsyncSubagentProcess) -> None:
@@ -329,20 +347,24 @@ class LocalAsyncSubagentManager:
         if spec.transport == "asgi":
             return spec
         if spec.is_running and self._healthcheck(spec):
+            self._emit_event("reused", spec)
             return spec
         if spec.external:
             if not self._healthcheck(spec):
                 raise RuntimeError(f"Configured async subagent '{name}' is unreachable at {spec.url}")
             spec.started_at = time.time()
             spec.last_error = None
+            self._emit_event("attached", spec)
             return spec
         if self._port_is_listening(spec.host, spec.port) and self._healthcheck(spec):
             spec.external = True
             spec.started_at = time.time()
             spec.last_error = None
+            self._emit_event("attached", spec)
             return spec
         self._spawn_process(spec)
         self._wait_until_healthy(spec)
+        self._emit_event("healthy", spec)
         return spec
 
     def ensure_all_started(self) -> list[LocalAsyncSubagentProcess]:
@@ -357,12 +379,22 @@ class LocalAsyncSubagentManager:
             if spec.external or proc is None or proc.poll() is not None:
                 continue
             try:
+                self._emit_event("stopping", spec)
                 proc.terminate()
                 proc.wait(timeout=2)
             except Exception:
                 proc.kill()
             finally:
+                self._emit_event("stopped", spec, pid=spec.pid)
                 spec.process = None
+
+    def drain_events(self) -> list[dict[str, Any]]:
+        events = list(self._events)
+        self._events.clear()
+        return events
+
+    def shutdown_turn_subagents(self) -> None:
+        self.shutdown_all()
 
     def build_async_subagents(self) -> list[AsyncSubAgent]:
         """Return the actual DeepAgents AsyncSubAgent specs."""
@@ -387,6 +419,20 @@ class LocalAsyncSubagentManager:
             "num_subagents": len(self._subagents),
             "asgi_subagents": sum(1 for name in self._subagents if self._ensure_spec(name).transport == "asgi"),
             "http_subagents": sum(1 for name in self._subagents if self._ensure_spec(name).transport == "http"),
+        }
+
+    def get_runtime_info(self, name: str) -> dict[str, Any]:
+        spec = self._ensure_spec(name)
+        return {
+            "name": spec.name,
+            "graph_id": spec.graph_id,
+            "transport": spec.transport,
+            "host": spec.host,
+            "port": spec.port,
+            "url": spec.url,
+            "pid": spec.pid,
+            "external": spec.external,
+            "status": spec.status(),
         }
 
     def get_async_subagent_specs(self) -> list[AsyncSubAgent]:

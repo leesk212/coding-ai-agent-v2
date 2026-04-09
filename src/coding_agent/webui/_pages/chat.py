@@ -19,9 +19,12 @@ Layout (top → bottom):
 import json
 import logging
 import re
+import threading
 import time
 import traceback
+import uuid
 
+import httpx
 import streamlit as st
 from langchain_core.messages import HumanMessage
 
@@ -135,6 +138,30 @@ def _escape_bubble_html(text: str) -> str:
         .replace("\r", "")
         .replace("\n", "<br>")
     )
+
+
+def _bubble_width_style(text: str, role: str) -> str:
+    """Return a width style that loosely tracks message length."""
+    plain = re.sub(r"\s+", " ", (text or "").replace("<br>", "\n")).strip()
+    lines = max(1, plain.count("\n") + 1)
+    length = len(plain)
+    if length <= 24:
+        width = 30
+    elif length <= 60:
+        width = 42
+    elif length <= 120:
+        width = 56
+    elif length <= 220:
+        width = 70
+    else:
+        width = 86
+    if lines >= 4:
+        width = min(90, width + 8)
+    if role == "user":
+        margin = "margin:0 0 8px auto;"
+    else:
+        margin = "margin:0 auto 8px 0;"
+    return f"display:inline-block;width:fit-content;max-width:{width}%;{margin}"
 
 
 def _edge_label(text: str, fallback: str, limit: int = 28) -> str:
@@ -579,6 +606,7 @@ def _stream_response(
     prompt: str,
     graph_ph,
     result_ph,
+    subagent_ph=None,
 ) -> bool:
     """Stream agent response — update flowchart, event feed, and result."""
     comp = st.session_state.agent_components
@@ -588,17 +616,14 @@ def _stream_response(
     agent = comp["agent"]
     fallback_mw = comp["fallback_middleware"]
     loop_guard = comp["loop_guard"]
+    subagent_runtime = comp.get("subagent_runtime")
 
     st.session_state.chat_messages.append({"role": "user", "content": prompt})
     loop_guard.reset()
 
-    # ── Stable per-conversation thread ID ────────────────────
-    thread_id = st.session_state.get("_conversation_thread_id")
-    if not thread_id:
-        import uuid as _uuid
-
-        thread_id = f"webui-{_uuid.uuid4().hex}"
-        st.session_state["_conversation_thread_id"] = thread_id
+    # ── Query-scoped thread ID ───────────────────────────────
+    thread_id = f"webui-query-{uuid.uuid4().hex}"
+    st.session_state["_last_query_thread_id"] = thread_id
     config = {"configurable": {"thread_id": thread_id}}
     inputs = {"messages": [HumanMessage(content=prompt)]}
 
@@ -661,12 +686,101 @@ def _stream_response(
         })
         history_snapshot_saved = True
 
+    def _render_subagent_outputs() -> None:
+        if subagent_ph is None:
+            return
+        rows = [a for a in tracked_agents if a.get("task_id") or a.get("live_output") or a.get("result_summary")]
+        if not rows:
+            subagent_ph.empty()
+            return
+        parts = [
+            "<div style='margin:8px 0 14px'>"
+            "<div style='font-size:.78em;font-weight:700;color:#64748b;letter-spacing:.35px;margin-bottom:6px'>"
+            "SubAgent Streaming Output</div>"
+        ]
+        for row in rows:
+            endpoint = row.get("endpoint") or ""
+            pid = row.get("pid")
+            status = row.get("status", "running")
+            content = row.get("live_output") or row.get("result_summary") or "waiting for output..."
+            parts.append(
+                "<div style='background:#fff;border:1px solid #bbf7d0;border-radius:14px;"
+                "padding:10px 12px;margin-bottom:8px;box-shadow:0 4px 14px rgba(22,163,74,.05)'>"
+                f"<div style='font-size:.8em;font-weight:700;color:#166534;margin-bottom:4px'>{_escape_html(row.get('type','subagent'))}</div>"
+                f"<div style='font-size:.72em;color:#64748b;margin-bottom:6px'>{_escape_html(endpoint)}"
+                f"{f'<br>pid {pid}' if pid else ''} · {_escape_html(status)}</div>"
+                f"<div style='font-size:.88em;color:#14532d;white-space:pre-wrap;max-height:180px;overflow-y:auto'>{_escape_bubble_html(str(content))}</div>"
+                "</div>"
+            )
+        parts.append("</div>")
+        subagent_ph.markdown("".join(parts), unsafe_allow_html=True)
+
+    def _drain_runtime_events(*, refresh: bool = True) -> None:
+        if subagent_runtime is None or not hasattr(subagent_runtime, "drain_events"):
+            return
+        runtime_events = subagent_runtime.drain_events()
+        if not runtime_events:
+            return
+
+        changed = False
+        for event in runtime_events:
+            host = _escape_html(str(event.get("host") or "127.0.0.1"))
+            port = _escape_html(str(event.get("port") or ""))
+            pid = event.get("pid")
+            name = _escape_html(str(event.get("name") or "subagent"))
+            etype = str(event.get("type") or "")
+            endpoint = f"{host}:{port}" if port else host
+            pid_line = f"<br>pid {pid}" if pid else ""
+            if etype == "spawned":
+                _evt("🚀", f"Spawned <b>{name}</b> on <b>{endpoint}</b>{pid_line}", "subagent", refresh=False)
+                changed = True
+            elif etype == "healthy":
+                _evt("✅", f"<b>{name}</b> healthy on <b>{endpoint}</b>{pid_line}", "subagent", refresh=False)
+                changed = True
+            elif etype == "attached":
+                _evt("🔌", f"Attached to <b>{name}</b> at <b>{endpoint}</b>{pid_line}", "subagent", refresh=False)
+                changed = True
+            elif etype == "reused":
+                _evt("♻️", f"Reusing <b>{name}</b> at <b>{endpoint}</b>{pid_line}", "subagent", refresh=False)
+                changed = True
+            elif etype == "stopping":
+                _evt("🧹", f"Stopping <b>{name}</b> at <b>{endpoint}</b>{pid_line}", "subagent", refresh=False)
+                changed = True
+            elif etype == "stopped":
+                _evt("🧹", f"Stopped <b>{name}</b> at <b>{endpoint}</b>{pid_line}", "subagent", refresh=False)
+                changed = True
+
+        if changed and refresh:
+            _refresh(True, result=final_text, model=current_model)
+
+    def _cleanup_turn_subagents() -> None:
+        if subagent_runtime is None or not hasattr(subagent_runtime, "shutdown_turn_subagents"):
+            return
+        try:
+            subagent_runtime.shutdown_turn_subagents()
+            _drain_runtime_events(refresh=False)
+        except Exception as exc:  # noqa: BLE001
+            _evt("⚠️", f"Subagent cleanup warning: {_escape_html(str(exc))}", "error", refresh=False)
+
+    def _cleanup_turn_subagents_async() -> None:
+        if subagent_runtime is None or not hasattr(subagent_runtime, "shutdown_turn_subagents"):
+            return
+
+        def _worker() -> None:
+            try:
+                subagent_runtime.shutdown_turn_subagents()
+            except Exception:
+                logger.exception("Background subagent cleanup failed")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _render_agent_status(text: str) -> None:
         """Show progress in the Agent bubble until actual model content arrives."""
         if final_text:
             return
+        bubble_style = _bubble_width_style(text, "agent")
         result_ph.markdown(
-            "<div class='agent-bubble'>"
+            f"<div class='agent-bubble' style='{bubble_style}'>"
             f"{text}<div class='agent-bubble-model'>Working...</div>"
             "</div>",
             unsafe_allow_html=True,
@@ -676,8 +790,9 @@ def _stream_response(
         model_html = ""
         if model:
             model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(model)}</div>"
+        bubble_style = _bubble_width_style(text, "agent")
         result_ph.markdown(
-            f"<div class='agent-bubble'>{_escape_bubble_html(text)}{model_html}</div>",
+            f"<div class='agent-bubble' style='{bubble_style}'>{_escape_bubble_html(text)}{model_html}</div>",
             unsafe_allow_html=True,
         )
 
@@ -767,11 +882,21 @@ def _stream_response(
         ts = time.strftime("%H:%M:%S")
         events.append({"icon": icon, "text": text, "css_class": css, "time": ts})
         _render_agent_status(f"{icon} {text}")
+        _render_subagent_outputs()
         if refresh:
             _refresh(True)
 
     def _track_spawn(agent_type: str, description: str) -> int:
         """Record a SubAgent spawn locally. Returns the index."""
+        endpoint = ""
+        pid = None
+        if subagent_runtime is not None:
+            try:
+                info = subagent_runtime.get_runtime_info(agent_type)
+                endpoint = f"{info.get('host', '127.0.0.1')}:{info.get('port', '')}"
+                pid = info.get("pid")
+            except Exception:
+                endpoint = ""
         idx = _sa_counter[0]
         _sa_counter[0] += 1
         tracked_agents.append({
@@ -785,6 +910,9 @@ def _stream_response(
             "run_id": "",
             "model": "",
             "started_at": time.time(),
+            "endpoint": endpoint,
+            "pid": pid,
+            "live_output": "",
         })
         print(
             "[CodingAgent Mermaid] spawn_async_subagent",
@@ -817,6 +945,86 @@ def _stream_response(
             if agent_row.get("task_id") == task_id:
                 return idx
         return None
+
+    def _sync_async_tasks_from_tracker() -> list[dict]:
+        rows = _capture_async_tasks()
+        for row in rows:
+            idx = _find_tracked_by_task_id(str(row.get("task_id", "")))
+            if idx is None:
+                continue
+            tracked_agents[idx]["run_id"] = str(row.get("run_id", "") or tracked_agents[idx].get("run_id", ""))
+            status = str(row.get("status", "")).lower()
+            if status in {"success", "completed"}:
+                tracked_agents[idx]["status"] = "completed"
+            elif status in {"error", "failed"}:
+                tracked_agents[idx]["status"] = "failed"
+            elif status == "cancelled":
+                tracked_agents[idx]["status"] = "cancelled"
+            else:
+                tracked_agents[idx]["status"] = "running"
+        return rows
+
+    def _poll_subagent_outputs() -> None:
+        if subagent_runtime is None:
+            return
+        _sync_async_tasks_from_tracker()
+        changed = False
+        for row in tracked_agents:
+            task_id = str(row.get("task_id", "") or "")
+            run_id = str(row.get("run_id", "") or "")
+            agent_type = str(row.get("type", "general"))
+            if not task_id:
+                continue
+            try:
+                runtime_info = subagent_runtime.get_runtime_info(agent_type)
+            except Exception:
+                continue
+            url = runtime_info.get("url")
+            if not url:
+                continue
+            row["endpoint"] = f"{runtime_info.get('host', '127.0.0.1')}:{runtime_info.get('port', '')}"
+            row["pid"] = runtime_info.get("pid")
+            try:
+                if run_id:
+                    run_resp = httpx.get(f"{url}/threads/{task_id}/runs/{run_id}", timeout=0.35)
+                    if run_resp.status_code == 200:
+                        data = run_resp.json()
+                        partial = str(data.get("partial_output", "") or "")
+                        if partial and partial != row.get("live_output", ""):
+                            row["live_output"] = partial
+                            changed = True
+                        status = str(data.get("status", "")).lower()
+                        if status in {"success", "completed"}:
+                            row["status"] = "completed"
+                        elif status in {"error", "failed"}:
+                            row["status"] = "failed"
+                        elif status == "cancelled":
+                            row["status"] = "cancelled"
+                        elif status:
+                            row["status"] = "running"
+                if row.get("status") == "completed":
+                    thread_resp = httpx.get(f"{url}/threads/{task_id}", timeout=0.35)
+                    if thread_resp.status_code == 200:
+                        messages = (thread_resp.json().get("messages") or [])
+                        assistants = [m for m in messages if isinstance(m, dict) and m.get("role") == "assistant"]
+                        if assistants:
+                            final_output = str(assistants[-1].get("content", "") or "")
+                            if final_output and final_output != row.get("result_summary", ""):
+                                row["result_summary"] = final_output
+                                row["live_output"] = final_output
+                                changed = True
+            except Exception:
+                continue
+        if changed:
+            _render_subagent_outputs()
+            _refresh(True, result=final_text, model=current_model)
+
+    def _unfinished_async_tasks() -> list[dict]:
+        rows = _sync_async_tasks_from_tracker()
+        return [
+            row for row in rows
+            if str(row.get("status", "")).lower() not in {"success", "completed", "error", "failed", "cancelled"}
+        ]
 
     def _track_complete(
         agent_type: str,
@@ -952,8 +1160,9 @@ def _stream_response(
                 if _cm:
                     _model_tag = f"<div class='agent-bubble-model'>🧠 {_escape_html(_cm)}</div>"
                 safe_final_text = _escape_bubble_html(final_text or "*(No response)*")
+                bubble_style = _bubble_width_style(final_text or "*(No response)*", "agent")
                 st.markdown(
-                    f"<div class='agent-bubble'>{safe_final_text}{_model_tag}</div>",
+                    f"<div class='agent-bubble' style='{bubble_style}'>{safe_final_text}{_model_tag}</div>",
                     unsafe_allow_html=True,
                 )
 
@@ -1002,8 +1211,10 @@ def _stream_response(
             )
 
         for raw_chunk in stream:
+            _drain_runtime_events(refresh=False)
             if _is_refresh_requested():
                 _evt("🛑", "Refresh requested — stopping current run", "error", refresh=False)
+                _cleanup_turn_subagents_async()
                 return False
             if _is_stop_requested():
                 _evt("🛑", "Stop requested — halting current run", "error", refresh=False)
@@ -1012,7 +1223,9 @@ def _stream_response(
                     _refresh(False, result=final_text, model=current_model)
                     _render_agent_answer(final_text, current_model)
                     _persist_history_snapshot(final_text, current_model)
+                    _cleanup_turn_subagents_async()
                     return True
+                _cleanup_turn_subagents_async()
                 _refresh(False)
                 return False
 
@@ -1055,6 +1268,7 @@ def _stream_response(
             for _node, node_output in chunk.items():
                 if _is_refresh_requested():
                     _evt("🛑", "Refresh requested — stopping current run", "error", refresh=False)
+                    _cleanup_turn_subagents_async()
                     return False
                 if _is_stop_requested():
                     _evt("🛑", "Stop requested — halting current run", "error", refresh=False)
@@ -1063,7 +1277,9 @@ def _stream_response(
                         _refresh(False, result=final_text, model=current_model)
                         _render_agent_answer(final_text, current_model)
                         _persist_history_snapshot(final_text, current_model)
+                        _cleanup_turn_subagents_async()
                         return True
+                    _cleanup_turn_subagents_async()
                     _refresh(False)
                     return False
 
@@ -1103,6 +1319,7 @@ def _stream_response(
                                         f"Launching <b>{atype}</b> async task: {desc}",
                                         "subagent",
                                     )
+                                    _drain_runtime_events(refresh=False)
                                 elif name == "list_async_tasks":
                                     _evt("📋", "Listing async task status", "subagent")
                                 elif name == "check_async_task":
@@ -1294,6 +1511,66 @@ def _stream_response(
                 # 매 chunk마다 모델명 갱신 시도
                 if fallback_mw.current_model:
                     current_model = fallback_mw.current_model
+                _drain_runtime_events(refresh=False)
+
+        had_async_subagents = bool(tracked_agents)
+        wait_rounds = 0
+        unfinished = _unfinished_async_tasks()
+        last_wait_count = -1
+        while unfinished and wait_rounds < 240:
+            if _is_refresh_requested():
+                _evt("🛑", "Refresh requested — stopping current run", "error", refresh=False)
+                _cleanup_turn_subagents_async()
+                return False
+            if _is_stop_requested():
+                _evt("🛑", "Stop requested — halting current run", "error", refresh=False)
+                _cleanup_turn_subagents_async()
+                _refresh(False, result=final_text, model=current_model)
+                return bool(final_text)
+            if len(unfinished) != last_wait_count:
+                _evt(
+                    "⏳",
+                    f"Waiting for {len(unfinished)} async task(s) to finish before closing this user session",
+                    "subagent",
+                    refresh=False,
+                )
+                last_wait_count = len(unfinished)
+            _poll_subagent_outputs()
+            _render_agent_status("Waiting for async subagents to finish...")
+            time.sleep(0.5)
+            wait_rounds += 1
+            unfinished = _unfinished_async_tasks()
+
+        if unfinished:
+            _evt(
+                "⚠️",
+                f"Timed out waiting for {len(unfinished)} async task(s); returning the latest available result",
+                "error",
+                refresh=False,
+            )
+
+        if had_async_subagents and not unfinished:
+            _evt("🧩", "All async subagents finished. Collecting results into one final answer", "subagent", refresh=False)
+            _render_agent_status("Collecting completed async task results...")
+            followup = (
+                "All async subagent tasks from this user turn should now be finished. "
+                "Collect every completed result using live async task tools if needed, "
+                "then produce one final synthesized answer for the user. "
+                "Do not launch new async tasks unless absolutely required."
+            )
+            try:
+                result = agent.invoke(
+                    {"messages": [HumanMessage(content=followup)]},
+                    config=config,
+                )
+                for msg in reversed(result.get("messages", [])):
+                    if _msg_type(msg) == "ai" and _msg_content(msg):
+                        content = _msg_content(msg)
+                        final_text = content if isinstance(content, str) else str(content)
+                        break
+            except Exception as exc:  # noqa: BLE001
+                _evt("⚠️", f"Final async aggregation failed: {_escape_html(str(exc))}", "error", refresh=False)
+            _poll_subagent_outputs()
 
         # ── Extract final text if not captured ────────────
 
@@ -1330,12 +1607,14 @@ def _stream_response(
         _refresh(False, result=final_text, model=current_model)
         with result_ph:
             safe_final_text = _escape_bubble_html(final_text)
+            bubble_style = _bubble_width_style(final_text, "agent")
             st.markdown(
-                f"<div class='agent-bubble'>{safe_final_text}{_model_tag}</div>",
+                f"<div class='agent-bubble' style='{bubble_style}'>{safe_final_text}{_model_tag}</div>",
                 unsafe_allow_html=True,
             )
 
         _persist_history_snapshot(final_text, current_model)
+        _cleanup_turn_subagents_async()
         return True
 
     except Exception as e:
@@ -1361,6 +1640,7 @@ def _stream_response(
             "num_agents": len(err_agents),
             "async_task_snapshot": _capture_async_tasks(),
         })
+        _cleanup_turn_subagents_async()
         return True
 
 
@@ -1426,8 +1706,6 @@ def render_chat() -> None:
         border: 1px solid #bfdbfe;
         border-radius: 16px 16px 4px 16px;
         padding: 14px 18px;
-        margin: 0 0 8px auto;
-        max-width: 92%;
         font-size: 0.95em;
         color: #1e40af;
         line-height: 1.55;
@@ -1449,8 +1727,6 @@ def render_chat() -> None:
         border: 1px solid #bbf7d0;
         border-radius: 16px 16px 16px 4px;
         padding: 14px 18px;
-        margin: 0 auto 8px 0;
-        max-width: 92%;
         font-size: 0.95em;
         color: #166534;
         line-height: 1.55;
@@ -1491,6 +1767,7 @@ def render_chat() -> None:
     # ── 1. Main content area ─────────────────────────────
     graph_ph = st.empty()
     result_ph_ref = {"ph": None}
+    subagent_ph_ref = {"ph": None}
 
     if not has_conversation:
         # ── Idle state: centered title (no heavy Mermaid render) ──
@@ -1505,6 +1782,7 @@ def render_chat() -> None:
         )
         # Lightweight hidden placeholders (no iframe rendering)
         result_ph_ref["ph"] = st.empty()
+        subagent_ph_ref["ph"] = st.empty()
 
     else:
         # ── Active conversation: chat-style layout ────────
@@ -1529,9 +1807,10 @@ def render_chat() -> None:
                 if msg.get("model"):
                     model_html = f"<div class='agent-bubble-model'>🧠 {_escape_html(msg['model'])}</div>"
                 safe_content = _escape_bubble_html(msg["content"])
+                agent_style = _bubble_width_style(msg["content"], "agent")
                 st.markdown(
                     f"<div class='agent-bubble-label'>🤖 Agent</div>"
-                    f"<div class='agent-bubble'>{safe_content}{model_html}</div>",
+                    f"<div class='agent-bubble' style='{agent_style}'>{safe_content}{model_html}</div>",
                     unsafe_allow_html=True,
                 )
 
@@ -1559,7 +1838,7 @@ def render_chat() -> None:
 
                 st.markdown(
                     f"<div class='user-bubble-label'>👤 User</div>"
-                    f"<div class='user-bubble'>{_escape_bubble_html(_last_user_content)}</div>",
+                    f"<div class='user-bubble' style='{_bubble_width_style(_last_user_content, 'user')}'>{_escape_bubble_html(_last_user_content)}</div>",
                     unsafe_allow_html=True,
                 )
 
@@ -1576,7 +1855,7 @@ def render_chat() -> None:
             result_ph_ref["ph"] = st.empty()
             if pending or is_running:
                 result_ph_ref["ph"].markdown(
-                    "<div class='agent-bubble'>"
+                    f"<div class='agent-bubble' style='{_bubble_width_style('Thinking...', 'agent')}'>"
                     "Thinking...<div class='agent-bubble-model'>Waiting for model output</div>"
                     "</div>",
                     unsafe_allow_html=True,
@@ -1593,10 +1872,12 @@ def render_chat() -> None:
                 idle_def, tips = _build_mermaid([], True, pending or "")
                 _render_mermaid(graph_ph, idle_def, [], True, num_agents=0, tooltips=tips)
 
+            subagent_ph_ref["ph"] = st.empty()
+
             prompt_display = pending or "(processing…)"
             st.markdown(
                 f"<div class='user-bubble-label'>👤 User</div>"
-                f"<div class='user-bubble'>{_escape_bubble_html(prompt_display)}</div>",
+                f"<div class='user-bubble' style='{_bubble_width_style(prompt_display, 'user')}'>{_escape_bubble_html(prompt_display)}</div>",
                 unsafe_allow_html=True,
             )
         else:
@@ -1669,7 +1950,7 @@ def render_chat() -> None:
         st.session_state["_is_running"] = True
         completed = False
         try:
-            completed = _stream_response(pending, graph_ph, result_ph_ref["ph"])
+            completed = _stream_response(pending, graph_ph, result_ph_ref["ph"], subagent_ph_ref["ph"])
         finally:
             st.session_state["_is_running"] = False
             st.session_state["_has_result"] = completed

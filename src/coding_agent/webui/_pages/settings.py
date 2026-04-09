@@ -102,15 +102,17 @@ def render_settings() -> None:
     topology = st.selectbox(
         "Deployment Topology",
         options=["single", "split", "hybrid"],
-        index=["single", "split", "hybrid"].index(settings.deployment_topology if settings.deployment_topology in {"single", "split", "hybrid"} else "single"),
+        index=["single", "split", "hybrid"].index(settings.deployment_topology if settings.deployment_topology in {"single", "split", "hybrid"} else "split"),
         help="single=langgraph co-deploy(ASGI), split=HTTP runtimes, hybrid=mixed",
     )
-    settings.deployment_topology = topology
+    if topology != settings.deployment_topology:
+        settings.deployment_topology = topology
+        os.environ["DEEPAGENTS_DEPLOYMENT_TOPOLOGY"] = topology
 
     deployment_url = st.text_input(
         "LangGraph Deployment URL",
         value=settings.langgraph_deployment_url,
-        help="Required for single topology when WebUI/CLI should talk to a running langgraph deployment.",
+        help="Required for single topology when the WebUI should talk to a running langgraph deployment.",
     )
     if deployment_url != settings.langgraph_deployment_url:
         settings.langgraph_deployment_url = deployment_url

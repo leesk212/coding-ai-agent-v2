@@ -13,12 +13,12 @@ DeepAgents v0.5 기반의 코딩 에이전트입니다.
 - 공식 DeepAgents async-subagent 패턴 사용
 - `single / split / hybrid` deployment topology 지원
 - Supervisor + specialist graph 분리
-- WebUI/CLI와 LangGraph deployment 실행 경로를 모두 지원
+- WebUI와 LangGraph deployment 실행 경로 지원
 
 ## Architecture
 
 ```text
-┌────────────────────────── WebUI / CLI ──────────────────────────┐
+┌────────────────────────────── WebUI ────────────────────────────┐
 │   Chat + Mermaid + SubAgent Monitor + Settings                  │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
@@ -47,7 +47,7 @@ DeepAgents v0.5 기반의 코딩 에이전트입니다.
 - `AsyncSubAgent` spec 기반 subagent 구성 (`researcher`, `coder`, `reviewer`, `debugger`)
 - `langgraph.json` graph registry 제공
 - 공식 single deployment(ASGI) 경로 제공
-- standalone WebUI/CLI용 split deployment(HTTP) 경로 제공
+- standalone WebUI용 split deployment(HTTP) 경로 제공
 - Async Task 도구 기반 상태 관리
 - `async_tasks` state 추적기 제공 (`AsyncTaskTracker`)
 - ChromaDB 장기 메모리 (`memory_store`, `memory_search`)
@@ -82,7 +82,7 @@ cp .env.example .env
 ### 1) WebUI 실행
 
 ```bash
-python -m coding_agent --webui
+python -m coding_agent
 ```
 
 브라우저: `http://localhost:8501`
@@ -94,26 +94,14 @@ python -m coding_agent --webui
 - 그렇지 않으면 standalone split topology로 로컬 AsyncSubAgent runtime을 기동합니다.
 - Chat에서 `start_async_task`/`check_async_task`/`list_async_tasks` 등으로 Task 운용
 
-### 2) CLI 실행
-
-```bash
-python -m coding_agent
-```
-
 single topology 예시:
 
 ```bash
 export DEEPAGENTS_DEPLOYMENT_TOPOLOGY=single
 export LANGGRAPH_DEPLOYMENT_URL=http://127.0.0.1:2024
 export LANGGRAPH_ASSISTANT_ID=supervisor
-python -m coding_agent --webui
+python -m coding_agent
 ```
-
-CLI 명령:
-- `/status` 모델 상태
-- `/memory` 메모리 통계
-- `/subagents` 프로세스 + tracked async tasks
-- `/quit` 종료
 
 ### 3) 디버그 실행
 
@@ -207,7 +195,7 @@ src/coding_agent/
 
 - Main Agent는 async task 도구를 통해 백그라운드 작업을 시작합니다.
 - 공식 DeepAgents `AsyncSubAgent` toolchain (`start/check/update/cancel/list`)을 사용합니다.
-- single topology에서는 co-deployed ASGI transport를, standalone WebUI/CLI에서는 split HTTP transport를 사용합니다.
+- single topology에서는 co-deployed ASGI transport를, standalone WebUI에서는 split HTTP transport를 사용합니다.
 - WebUI는 conversation 단위 `thread_id`를 유지하고, Mermaid에 task 흐름을 반영합니다.
 - 각 assistant 결과는 `async_task_snapshot`을 함께 저장해 히스토리 시점 비교가 가능합니다.
 - 기본 정책은 "동일 질의 내 결과 취합"입니다. 별도 요청이 없으면 launch 후 `check_async_task`로 결과를 모아 최종 답변을 만듭니다.

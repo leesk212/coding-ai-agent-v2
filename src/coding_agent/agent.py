@@ -13,6 +13,7 @@ from coding_agent.async_task_tracker import AsyncTaskTracker
 from coding_agent.config import Settings, settings
 from coding_agent.middleware.async_only_subagents import AsyncOnlySubagentsMiddleware
 from coding_agent.middleware.async_task_completion import AsyncTaskCompletionMiddleware
+from coding_agent.middleware.lazy_async_subagents import LazyAsyncSubagentsMiddleware
 from coding_agent.middleware.long_term_memory import LongTermMemoryMiddleware
 from coding_agent.middleware.model_fallback import ModelFallbackMiddleware
 
@@ -132,13 +133,14 @@ def create_coding_agent(
     )
     ltm_mw = LongTermMemoryMiddleware(memory_dir=str(cfg.memory_dir))
     async_only_mw = AsyncOnlySubagentsMiddleware()
-    completion_mw = AsyncTaskCompletionMiddleware()
-    loop_guard = AgentLoopGuard(max_iterations=cfg.max_iterations)
     subagent_runtime = LocalAsyncSubagentManager(
         cfg=cfg,
         root_dir=working_dir,
         topology=topology,
     )
+    lazy_async_mw = LazyAsyncSubagentsMiddleware(subagent_runtime)
+    completion_mw = AsyncTaskCompletionMiddleware()
+    loop_guard = AgentLoopGuard(max_iterations=cfg.max_iterations)
 
     async_subagents: list[AsyncSubAgent] = subagent_runtime.build_async_subagents()
     checkpointer = MemorySaver()
@@ -151,7 +153,7 @@ def create_coding_agent(
     agent = create_deep_agent(
         model=fallback_mw.get_model_with_fallback(),
         system_prompt=SYSTEM_PROMPT,
-        middleware=[fallback_mw, ltm_mw, async_only_mw, completion_mw],
+        middleware=[fallback_mw, ltm_mw, async_only_mw, lazy_async_mw, completion_mw],
         tools=ltm_mw.get_tools(),
         subagents=async_subagents,
         memory=_setup_agents_md(),

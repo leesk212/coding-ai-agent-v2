@@ -16,11 +16,26 @@ class RuntimeSelectionTests(unittest.TestCase):
             langgraph_deployment_url="http://localhost:2024",
         )
         with tempfile.TemporaryDirectory() as tmp:
-            with patch("coding_agent.runtime.create_remote_coding_agent", return_value={"mode": "remote"}) as remote_mock:
-                result = create_runtime_components(cfg, cwd=Path(tmp))
+            with patch("coding_agent.runtime.check_langgraph_deployment") as check_mock:
+                with patch("coding_agent.runtime.create_remote_coding_agent", return_value={"mode": "remote"}) as remote_mock:
+                    result = create_runtime_components(cfg, cwd=Path(tmp))
 
         self.assertEqual(result, {"mode": "remote"})
+        check_mock.assert_called_once()
         remote_mock.assert_called_once()
+
+    def test_single_topology_falls_back_to_split_when_deployment_unreachable(self) -> None:
+        cfg = Settings(
+            deployment_topology="single",
+            langgraph_deployment_url="http://localhost:2024",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("coding_agent.runtime.check_langgraph_deployment", side_effect=RuntimeError("down")):
+                with patch("coding_agent.runtime.create_coding_agent", return_value={"mode": "local"}) as local_mock:
+                    result = create_runtime_components(cfg, cwd=Path(tmp))
+
+        self.assertEqual(result, {"mode": "local"})
+        local_mock.assert_called_once()
 
     def test_split_topology_uses_local_runtime(self) -> None:
         cfg = Settings(deployment_topology="split")

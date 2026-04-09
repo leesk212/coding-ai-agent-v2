@@ -82,7 +82,7 @@ class Settings:
         default_factory=lambda: int(os.getenv("MAX_SUBAGENTS", "3"))
     )
     deployment_topology: str = field(
-        default_factory=lambda: os.getenv("DEEPAGENTS_DEPLOYMENT_TOPOLOGY", "single")
+        default_factory=lambda: os.getenv("DEEPAGENTS_DEPLOYMENT_TOPOLOGY", "split")
     )
     langgraph_deployment_url: str = field(
         default_factory=lambda: os.getenv("LANGGRAPH_DEPLOYMENT_URL", "")

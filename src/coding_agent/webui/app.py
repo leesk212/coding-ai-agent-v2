@@ -109,10 +109,36 @@ def _init_agent():
             log("🧭", f"Topology: {topo}", 91)
 
             t0 = time.time()
-            log("🤖", "Preparing DeepAgents AsyncSubAgent runtimes...", 92)
             manager = components["subagent_runtime"]
-            specs = manager.ensure_all_started()
-            log("✅", f"Async subagents healthy ({len(specs)}) — {time.time()-t0:.1f}s", 97)
+            summary = manager.topology_summary()
+            log("🤖", "Configuring AsyncSubAgent runtime policy...", 92)
+            if summary["topology"] == "split":
+                log(
+                    "⏳",
+                    (
+                        "Split topology enabled: subagent processes will launch "
+                        "on demand when MainAgent calls start_async_task"
+                    ),
+                    95,
+                )
+            else:
+                log(
+                    "🧩",
+                    (
+                        f"{summary['topology']} topology enabled: subagents are "
+                        "resolved inside the current deployment/runtime"
+                    ),
+                    95,
+                )
+            log(
+                "✅",
+                (
+                    "Async subagent policy ready "
+                    f"({summary['num_subagents']} specs, {summary['http_subagents']} HTTP, "
+                    f"{summary['asgi_subagents']} ASGI) — {time.time()-t0:.1f}s"
+                ),
+                97,
+            )
 
             total_elapsed = time.time() - t_init_start
             log("🚀", f"Ready! (total {total_elapsed:.1f}s)", 100)

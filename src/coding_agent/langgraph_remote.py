@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 from types import SimpleNamespace
 from typing import Any
 
@@ -52,6 +53,7 @@ class RemoteLangGraphAgent:
 
     def __init__(self, deployment_url: str, assistant_id: str) -> None:
         self._client = get_sync_client(url=deployment_url, api_key=None)
+        self._deployment_url = deployment_url
         self._assistant_id = assistant_id
 
     @staticmethod
@@ -111,6 +113,19 @@ class RemoteLangGraphAgent:
             return SimpleNamespace(values={})
         state = self._client.threads.get_state(thread_id=thread_id)
         return SimpleNamespace(values=state.get("values") or {}, metadata=state.get("metadata") or {})
+
+
+def check_langgraph_deployment(deployment_url: str, assistant_id: str) -> None:
+    """Raise if the configured LangGraph deployment is unreachable or misconfigured."""
+    client = get_sync_client(url=deployment_url, api_key=None)
+    try:
+        client.assistants.get(assistant_id)
+    except httpx.HTTPError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"LangGraph deployment is reachable but assistant `{assistant_id}` could not be loaded: {exc}"
+        ) from exc
 
 
 def create_remote_coding_agent(

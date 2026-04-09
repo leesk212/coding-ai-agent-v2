@@ -55,7 +55,8 @@ def _init_db() -> None:
             assistant_id TEXT NOT NULL,
             status       TEXT NOT NULL DEFAULT 'pending',
             created_at   TEXT NOT NULL,
-            error        TEXT
+            error        TEXT,
+            partial_output TEXT NOT NULL DEFAULT ''
         );
     """)
     _CONN.commit()
@@ -78,10 +79,43 @@ def _get_thread(thread_id: str) -> dict[str, Any] | None:
 
 def _get_run(run_id: str) -> dict[str, Any] | None:
     row = _CONN.execute(
-        "SELECT run_id, thread_id, assistant_id, status, created_at, error FROM runs WHERE run_id = ?",
+        "SELECT run_id, thread_id, assistant_id, status, created_at, error, partial_output FROM runs WHERE run_id = ?",
         (run_id,),
     ).fetchone()
     return dict(row) if row is not None else None
+
+
+def _message_text_delta(message: Any) -> str:
+    if isinstance(message, dict):
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        return str(content) if content else ""
+
+    blocks = getattr(message, "content_blocks", None)
+    if blocks:
+        return "".join(
+            str(block.get("text", ""))
+            for block in blocks
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and "text" in block
+        )
+    return ""
 
 
 def _bootstrap_agent():
@@ -120,9 +154,42 @@ async def _execute_run(run_id: str, thread_id: str, user_message: str) -> None:
     _CONN.execute("UPDATE runs SET status = 'running' WHERE run_id = ?", (run_id,))
     _CONN.commit()
     try:
-        result = await _AGENT.ainvoke({"messages": [HumanMessage(user_message)]})
-        last = result["messages"][-1]
-        output = last.content if isinstance(last.content, str) else json.dumps(last.content)
+        output = ""
+        streamed = False
+        if hasattr(_AGENT, "astream"):
+            try:
+                async for chunk in _AGENT.astream(
+                    {"messages": [HumanMessage(user_message)]},
+                    stream_mode=["messages"],
+                ):
+                    message = None
+                    if isinstance(chunk, tuple) and len(chunk) == 2:
+                        message, _metadata = chunk
+                    elif isinstance(chunk, tuple) and len(chunk) == 3:
+                        _namespace, _mode, payload = chunk
+                        if isinstance(payload, tuple) and len(payload) == 2:
+                            message, _metadata = payload
+                    if message is None:
+                        continue
+                    delta = _message_text_delta(message)
+                    if not delta:
+                        continue
+                    streamed = True
+                    output += delta
+                    _CONN.execute(
+                        "UPDATE runs SET partial_output = ? WHERE run_id = ?",
+                        (output, run_id),
+                    )
+                    _CONN.commit()
+            except Exception:
+                streamed = False
+                output = ""
+
+        if not streamed:
+            result = await _AGENT.ainvoke({"messages": [HumanMessage(user_message)]})
+            last = result["messages"][-1]
+            output = last.content if isinstance(last.content, str) else json.dumps(last.content)
+
         assistant_msg = {"role": "assistant", "content": output}
         row = _CONN.execute(
             "SELECT messages FROM threads WHERE thread_id = ?",
@@ -135,12 +202,15 @@ async def _execute_run(run_id: str, thread_id: str, user_message: str) -> None:
             "UPDATE threads SET messages = ?, values_ = ? WHERE thread_id = ?",
             (serialized, json.dumps({"messages": msgs}), thread_id),
         )
-        _CONN.execute("UPDATE runs SET status = 'success' WHERE run_id = ?", (run_id,))
+        _CONN.execute(
+            "UPDATE runs SET status = 'success', partial_output = ? WHERE run_id = ?",
+            (output, run_id),
+        )
         _CONN.commit()
     except Exception as exc:  # noqa: BLE001
         _CONN.execute(
-            "UPDATE runs SET status = 'error', error = ? WHERE run_id = ?",
-            (str(exc), run_id),
+            "UPDATE runs SET status = 'error', error = ?, partial_output = ? WHERE run_id = ?",
+            (str(exc), output if 'output' in locals() else "", run_id),
         )
         _CONN.commit()
 
