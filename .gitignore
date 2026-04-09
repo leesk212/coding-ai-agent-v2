@@ -8,3 +8,4 @@ build/
 .claude/
 workspace/
 *.sqlite
+.pytest_cache/

@@ -414,6 +414,8 @@ def main():
     qp = st.query_params
     if qp.get("page") == "settings" and st.session_state.page != "settings":
         st.session_state.page = "settings"
+    elif qp.get("page") == "memory" and st.session_state.page != "memory":
+        st.session_state.page = "memory"
     elif qp.get("page") == "chat" and st.session_state.page != "chat":
         st.session_state.page = "chat"
     if qp.get("refresh") == "1":
@@ -428,12 +430,21 @@ def main():
     if page == "settings":
         from coding_agent.webui._pages.settings import render_settings
         render_settings()
-        # Settings 페이지 하단에 Chat 복귀 링크
         st.markdown(
-            '<a href="?page=chat" target="_self" '
-            'style="position:fixed;bottom:1rem;left:1.2rem;'
-            'font-size:0.85rem;color:#64748b;text-decoration:none;z-index:9999;">'
-            'Back to Chat</a>',
+            '<div style="position:fixed;bottom:1rem;left:1.2rem;display:flex;gap:.9rem;align-items:center;z-index:9999;">'
+            '<a href="?page=chat" target="_self" style="font-size:0.85rem;color:#64748b;text-decoration:none;">Back to Chat</a>'
+            '<a href="?page=memory" target="_self" style="font-size:0.85rem;color:#64748b;text-decoration:none;">Memory</a>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    elif page == "memory":
+        from coding_agent.webui._pages.memory import render_memory
+        render_memory()
+        st.markdown(
+            '<div style="position:fixed;bottom:1rem;left:1.2rem;display:flex;gap:.9rem;align-items:center;z-index:9999;">'
+            '<a href="?page=chat" target="_self" style="font-size:0.85rem;color:#64748b;text-decoration:none;">Back to Chat</a>'
+            '<a href="?page=settings" target="_self" style="font-size:0.85rem;color:#64748b;text-decoration:none;">Settings</a>'
+            '</div>',
             unsafe_allow_html=True,
         )
     else:
@@ -455,6 +466,9 @@ def main():
             '<a href="?page=settings" target="_self" '
             'style="font-size:0.85rem;color:#64748b;text-decoration:none;">'
             'Settings</a>'
+            '<a href="?page=memory" target="_self" '
+            'style="font-size:0.85rem;color:#64748b;text-decoration:none;">'
+            'Memory</a>'
             '</div>',
             unsafe_allow_html=True,
         )

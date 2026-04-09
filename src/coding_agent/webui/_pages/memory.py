@@ -1,103 +1,83 @@
-"""Memory dashboard - view, search, and manage long-term memories."""
+"""Memory dashboard - browse and correct durable long-term memory records."""
 
 import streamlit as st
-from coding_agent.memory.categories import MemoryCategory
+
+from coding_agent.config import settings
+from coding_agent.state.store import DurableStateStore
 
 
 def render_memory() -> None:
-    st.title("🧠 Long-Term Memory")
+    st.title("🧠 Memory Records")
+    st.caption("Browse approved long-term memory artifacts and correct records when needed.")
 
-    components = st.session_state.get("agent_components")
-    if not components:
-        st.warning("Agent not initialized. Check Settings.")
-        return
+    store = DurableStateStore(settings.state_dir / "agent_state.db")
 
-    memory_mw = components["memory_middleware"]
-    store = memory_mw.store
-
-    # Stats overview
-    stats = store.get_stats()
-    total = sum(stats.values())
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Total", total)
-    col2.metric("Domain", stats.get("domain_knowledge", 0))
-    col3.metric("Preferences", stats.get("user_preferences", 0))
-    col4.metric("Patterns", stats.get("code_patterns", 0))
-    col5.metric("Project", stats.get("project_context", 0))
-
-    st.markdown("---")
-
-    # Tabs for different operations
-    tab_browse, tab_search, tab_add = st.tabs(["📋 Browse", "🔍 Search", "➕ Add"])
-
-    # Browse tab
-    with tab_browse:
-        category = st.selectbox(
-            "Category",
-            [c.value for c in MemoryCategory],
-            key="browse_category",
+    col1, col2 = st.columns(2)
+    with col1:
+        layer_filter = st.selectbox(
+            "Layer",
+            options=["all", "project/context", "domain/knowledge", "user/profile"],
+            index=0,
+        )
+    with col2:
+        status_filter = st.selectbox(
+            "Status",
+            options=["active", "superseded", "all"],
+            index=0,
         )
 
-        entries = store.get_all(MemoryCategory(category))
+    search_query = st.text_input(
+        "Search",
+        value="",
+        help="Search durable memory content and tags.",
+    )
 
-        if not entries:
-            st.info(f"No memories in '{category}' yet.")
-        else:
-            for entry in entries:
-                with st.expander(f"📝 {entry['content'][:80]}...", expanded=False):
-                    st.markdown(entry["content"])
-                    st.caption(f"ID: {entry['id']}")
-                    if entry.get("metadata"):
-                        st.json(entry["metadata"])
-                    if st.button("🗑️ Delete", key=f"del_{entry['id']}"):
-                        store.delete(entry["id"], MemoryCategory(category))
-                        st.success("Deleted!")
-                        st.rerun()
-
-    # Search tab
-    with tab_search:
-        query = st.text_input("Search query", placeholder="e.g., Python coding style preferences")
-        search_category = st.selectbox(
-            "Filter by category (optional)",
-            ["All"] + [c.value for c in MemoryCategory],
-            key="search_category",
+    if search_query.strip():
+        records = store.search_memory(
+            search_query.strip(),
+            layer=None if layer_filter == "all" else layer_filter,
+            limit=50,
         )
-        n_results = st.slider("Max results", 1, 20, 5)
-
-        if st.button("🔍 Search") and query:
-            cat = MemoryCategory(search_category) if search_category != "All" else None
-            results = store.search(query, cat, n_results)
-
-            if not results:
-                st.info("No matching memories found.")
-            else:
-                for r in results:
-                    similarity = 1 - r["distance"]
-                    color = "green" if similarity > 0.7 else "orange" if similarity > 0.4 else "red"
-                    st.markdown(
-                        f"**[{r['category']}]** Similarity: :{color}[{similarity:.2f}]"
-                    )
-                    st.markdown(r["content"])
-                    st.markdown("---")
-
-    # Add tab
-    with tab_add:
-        st.markdown("Manually add a memory entry.")
-        add_content = st.text_area("Content", placeholder="Enter the knowledge to store...")
-        add_category = st.selectbox(
-            "Category",
-            [c.value for c in MemoryCategory],
-            key="add_category",
+        if status_filter != "all":
+            records = [row for row in records if str(row.get("status", "")) == status_filter]
+    else:
+        records = store.list_memory_records(
+            layer=None if layer_filter == "all" else layer_filter,
+            status=None if status_filter == "all" else status_filter,
+            limit=50,
         )
-        add_tags = st.text_input("Tags (comma-separated)", placeholder="python, testing, best-practice")
 
-        if st.button("💾 Store") and add_content:
-            metadata = {}
-            if add_tags:
-                metadata["tags"] = add_tags
-            metadata["source"] = "manual"
+    st.caption(f"Loaded records: {len(records)}")
 
-            doc_id = store.store(add_content, MemoryCategory(add_category), metadata)
-            st.success(f"Stored with ID: {doc_id}")
-            st.rerun()
+    for idx, row in enumerate(records):
+        record_id = str(row.get("record_id", ""))
+        layer = str(row.get("layer", "unknown"))
+        status = str(row.get("status", "unknown"))
+        with st.expander(f"{record_id} · {layer} · {status}", expanded=False):
+            st.caption(
+                f"source={row.get('source', '')} · scope={row.get('scope_key', '')} · "
+                f"updated={row.get('updated_at', '')}"
+            )
+            st.code(str(row.get("content", "")), language="text")
+            corrected_content = st.text_area(
+                "Corrected Content",
+                value=str(row.get("content", "")),
+                height=220,
+                key=f"memory_page_correct_content_{idx}",
+            )
+            correction_reason = st.text_input(
+                "Correction Reason",
+                value="",
+                key=f"memory_page_correct_reason_{idx}",
+            )
+            if st.button("Save Correction", key=f"memory_page_correct_btn_{idx}", use_container_width=True):
+                new_id = store.store_memory(
+                    layer=layer,
+                    content=corrected_content.strip(),
+                    scope_key=str(row.get("scope_key", "global")),
+                    source="memory_page_correction",
+                    tags=[correction_reason.strip()] if correction_reason.strip() else [],
+                    correction_of=record_id,
+                )
+                st.success(f"Stored correction as {new_id}")
+                st.rerun()

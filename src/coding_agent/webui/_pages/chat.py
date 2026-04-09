@@ -31,8 +31,10 @@ import httpx
 import streamlit as st
 import streamlit.components.v1 as components
 from langchain_core.messages import HumanMessage
+from coding_agent.memory.categories import MemoryCategory
 
 from coding_agent.config import settings
+from coding_agent.middleware.long_term_memory import LongTermMemoryMiddleware
 from coding_agent.resilience import get_policy
 from coding_agent.runtime import create_runtime_components
 
@@ -42,6 +44,7 @@ AGENT_ICONS = {
     "coder": "✍️", "code_writer": "✍️", "researcher": "🔍", "reviewer": "📋",
     "debugger": "🐛", "frontend": "🖥️", "backend": "🗄️", "planner": "🗂️",
     "architect": "🏗️", "mobile": "📱", "general": "🤖",
+    "remember": "🧠",
 }
 
 TEST_PROMPTS = {
@@ -100,7 +103,16 @@ TEST_PROMPTS = {
         "모델 정책 증빙 테스트다. 현재 사용 중인 모델 식별자를 말하고, "
         "OpenRouter 우선 사용 여부, fallback 모델, tool calling/긴 문맥/모델 전환 제약을 요약해라."
     ),
-    "산출물 인풋": (
+    "Remember Agent": (
+        "Remember agent 동작 확인 테스트다. 간단한 산출물을 하나 이상 만든 뒤, "
+        "turn 마지막에 remember subagent를 호출해서 현재 query workspace에서 장기 메모리화할 가치가 높은 "
+        "파일 후보를 최대 10개까지 추려라. 각 후보에 대해 왜 기억할 가치가 있는지 짧게 설명하고, "
+        "최종적으로 Human in the Loop 승인이 필요하다는 점을 명시해라."
+    ),
+}
+
+SCENARIO_PROMPTS = {
+    "Scenario_1 : PMS시스템 구성": (
         "## Task\n\n"
         "PMS (project manage system) 시스템을 구성하는 프로젝트.\n\n"
         "## Process\n\n"
@@ -135,7 +147,11 @@ TEST_PROMPT_DETAILS = {
     "Blocked/Failed": "blocked 또는 failed 상태 감지와 alternate path 정책을 검증합니다.",
     "Loop Safety": "timeout, 무진전, tool 오류, safe stop 같은 복원력 정책을 검증합니다.",
     "Model Policy": "현재 모델, fallback, 제약사항이 설명 가능한지 검증합니다.",
-    "산출물 인풋": "PMS 프로젝트형 요청을 입력해 planner, architect, frontend, mobile, backend, reviewer 분할과 실행 가능한 코드 산출까지 유도하는 테스트입니다.",
+    "Remember Agent": "remember subagent가 장기 메모리 후보 파일을 고르고 Human in the Loop 검토 대상으로 넘기는지 검증합니다.",
+}
+
+SCENARIO_PROMPT_DETAILS = {
+    "Scenario_1 : PMS시스템 구성": "PMS 프로젝트형 요청을 입력해 planner, architect, frontend, mobile, backend, reviewer 분할과 실행 가능한 코드 산출까지 유도하는 시나리오 테스트입니다.",
 }
 
 BLOCKED_AFTER_SECONDS = 45.0
@@ -151,6 +167,7 @@ ALTERNATE_ROLE_POLICY = {
     "debugger": "reviewer",
     "researcher": "reviewer",
     "reviewer": "coder",
+    "remember": "reviewer",
     "general": "reviewer",
 }
 
@@ -228,6 +245,24 @@ def _build_workdir_zip_bytes(workdir: str | Path | None) -> bytes | None:
     return buf.getvalue()
 
 
+def _read_workspace_file_bytes(workdir: str | Path | None, rel_path: str) -> bytes | None:
+    if not workdir or not rel_path:
+        return None
+    root = Path(workdir).expanduser().resolve()
+    candidate = (root / rel_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except Exception:
+        return None
+    if not candidate.exists() or not candidate.is_file():
+        return None
+    try:
+        return candidate.read_bytes()
+    except Exception:
+        logger.exception("Failed to read workspace file for download: %s", candidate)
+        return None
+
+
 def _get_cached_workdir_zip_bytes(workdir: str | Path | None) -> bytes | None:
     if not workdir:
         return None
@@ -236,6 +271,222 @@ def _get_cached_workdir_zip_bytes(workdir: str | Path | None) -> bytes | None:
     if key not in cache:
         cache[key] = _build_workdir_zip_bytes(key)
     return cache.get(key)
+
+
+def _workspace_has_artifacts(workdir: str | Path | None) -> bool:
+    if not workdir:
+        return False
+    root = Path(workdir).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        return False
+    return any(path.is_file() for path in root.rglob("*"))
+
+
+def _remember_candidate_score(path: Path, root: Path) -> tuple[int, str]:
+    rel = str(path.relative_to(root)).lower()
+    name = path.name.lower()
+    suffix = path.suffix.lower()
+    score = 0
+    reasons: list[str] = []
+    if any(token in rel for token in ("prd", "spec", "architecture", "design", "requirements")):
+        score += 120
+        reasons.append("spec artifact")
+    if any(token in rel for token in ("readme", "api", "contract", "schema", "gantt")):
+        score += 90
+        reasons.append("durable project context")
+    if "/tests/" in rel or name.startswith("test_") or suffix in {".spec.ts", ".test.ts"}:
+        score += 80
+        reasons.append("behavior-encoding test")
+    if suffix in {".py", ".ts", ".tsx", ".js", ".jsx", ".md", ".json", ".yaml", ".yml"}:
+        score += 40
+    if "/node_modules/" in rel or "/.git/" in rel or "__pycache__" in rel:
+        score -= 500
+    if path.stat().st_size > 200_000:
+        score -= 50
+    return score, ", ".join(reasons) or "important artifact"
+
+
+def _select_remember_candidates(workdir: str | Path | None, limit: int = 10) -> list[dict]:
+    if not workdir:
+        return []
+    root = Path(workdir).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        return []
+    scored: list[tuple[int, dict]] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            score, reason = _remember_candidate_score(path, root)
+        except Exception:
+            continue
+        if score <= 0:
+            continue
+        rel = str(path.relative_to(root))
+        scored.append((score, {"path": rel, "reason": reason, "bytes": path.stat().st_size}))
+    scored.sort(key=lambda item: (-item[0], item[1]["path"]))
+    return [item[1] for item in scored[:limit]]
+
+
+def _parse_remember_candidates_from_history(subagent_history: list[dict], workdir: str | Path | None, limit: int = 10) -> list[dict]:
+    if not subagent_history:
+        return []
+    root = Path(workdir).expanduser().resolve() if workdir else None
+    remember_rows = [
+        row for row in subagent_history
+        if str(row.get("type", "")).lower() == "remember"
+        and str(row.get("status", "") or row.get("durable_state", "")).lower() == "completed"
+    ]
+    if not remember_rows:
+        return []
+    text = str(remember_rows[-1].get("result_summary", "") or remember_rows[-1].get("live_output", "") or "")
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lstrip("-*0123456789. ").strip()
+        if not line:
+            continue
+        path_match = re.search(r"([A-Za-z0-9_./-]+\.(?:md|txt|py|ts|tsx|js|jsx|json|ya?ml))", line)
+        if not path_match:
+            continue
+        rel = path_match.group(1)
+        if rel in seen:
+            continue
+        seen.add(rel)
+        reason = line.replace(rel, "").strip(" :-") or "remember agent recommended this artifact"
+        size = 0
+        if root is not None:
+            path = root / rel
+            if path.exists() and path.is_file():
+                try:
+                    size = path.stat().st_size
+                except Exception:
+                    size = 0
+        candidates.append({"path": rel, "reason": reason, "bytes": size, "source": "remember_subagent"})
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def _render_live_remember_review() -> None:
+    review = st.session_state.get("_pending_human_review")
+    if not review or str(review.get("status", "")) != "pending":
+        return
+    candidates = review.get("candidates") or []
+    workdir = str(review.get("workdir", "") or "")
+    st.markdown(
+        "<div style='background:#fff7ed;border:1px solid #fdba74;border-radius:14px;padding:12px 14px;margin:10px 0'>"
+        "<div style='font-size:.88em;font-weight:700;color:#9a3412;margin-bottom:6px'>Human In the Loop · Remember Review</div>"
+        "<div style='font-size:.82em;color:#9a3412'>The remember subagent paused this turn for approval. "
+        "Review the nominated files, approve the ones that should become long-term memory, then continue the same session.</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    if workdir:
+        st.caption(f"Workspace: {workdir}")
+    if not candidates:
+        st.warning("No remember candidates were produced.")
+        return
+    for idx, row in enumerate(candidates):
+        file_cols = st.columns([6, 2])
+        with file_cols[0]:
+            st.markdown(
+                f"**{_escape_html(str(row.get('path', '')))}**  \n"
+                f"<span style='color:#64748b;font-size:.86em'>{_escape_html(str(row.get('reason', '')))}</span>",
+                unsafe_allow_html=True,
+            )
+        with file_cols[1]:
+            file_bytes = _read_workspace_file_bytes(workdir, str(row.get("path", "") or ""))
+            if file_bytes:
+                st.download_button(
+                    "Download",
+                    data=file_bytes,
+                    file_name=Path(str(row.get("path", "artifact"))).name,
+                    mime="application/octet-stream",
+                    key=f"live_remember_download_{idx}_{row.get('path', '')}",
+                    use_container_width=True,
+                )
+    default_selection = [row["path"] for row in candidates[: min(5, len(candidates))]]
+    with st.form("live_remember_review_form"):
+        selected_paths = st.multiselect(
+            "Approve files for long-term memory",
+            options=[row["path"] for row in candidates],
+            default=review.get("selected_paths", default_selection),
+            format_func=lambda p: next(
+                (
+                    f"{row['path']} · {row['reason']}"
+                    for row in candidates if row["path"] == p
+                ),
+                p,
+            ),
+        )
+        target_layer = st.selectbox(
+            "Memory Layer",
+            options=["project/context", "domain/knowledge", "user/profile"],
+            index=["project/context", "domain/knowledge", "user/profile"].index(
+                str(review.get("target_layer", "project/context"))
+            ),
+        )
+        approve_col, reject_col = st.columns(2)
+        with approve_col:
+            approve = st.form_submit_button("Approve and Continue", use_container_width=True)
+        with reject_col:
+            reject = st.form_submit_button("Reject and Continue", use_container_width=True)
+    if approve:
+        stored_ids = _store_approved_memory_files(workdir, selected_paths, target_layer)
+        st.session_state["_human_review_resolution"] = {
+            "approved": True,
+            "selected_paths": list(selected_paths),
+            "target_layer": target_layer,
+            "stored_ids": stored_ids,
+        }
+        st.session_state.pop("_pending_human_review", None)
+        st.rerun()
+    if reject:
+        st.session_state["_human_review_resolution"] = {
+            "approved": False,
+            "selected_paths": [],
+            "target_layer": target_layer,
+            "stored_ids": [],
+        }
+        st.session_state.pop("_pending_human_review", None)
+        st.rerun()
+
+
+def _remember_layer_to_category(layer: str) -> MemoryCategory:
+    mapping = {
+        "project/context": MemoryCategory.PROJECT_CONTEXT,
+        "domain/knowledge": MemoryCategory.DOMAIN_KNOWLEDGE,
+        "user/profile": MemoryCategory.USER_PREFERENCES,
+    }
+    return mapping[layer]
+
+
+def _store_approved_memory_files(workdir: str, selected_paths: list[str], layer: str) -> list[str]:
+    root = Path(workdir).expanduser().resolve()
+    ltm = LongTermMemoryMiddleware(memory_dir=str(settings.memory_dir))
+    category = _remember_layer_to_category(layer)
+    stored_ids: list[str] = []
+    for rel_path in selected_paths[:10]:
+        path = root / rel_path
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        trimmed = content[:15000]
+        durable_payload = f"[remember_agent]\nfile: {rel_path}\nlayer: {layer}\n\n{trimmed}"
+        record_id = ltm._state_store.store_memory(
+            layer=layer,
+            content=durable_payload,
+            scope_key=root.name,
+            source="remember_agent_human_approved",
+            tags=["remember_agent", rel_path],
+        )
+        ltm.store.store(trimmed, category, {"source": "remember_agent_human_approved", "path": rel_path})
+        stored_ids.append(record_id)
+    return stored_ids
 
 
 # ─────────────────────────────────────────────────────────
@@ -953,7 +1204,16 @@ def _resume_async_monitoring(
     current_model = str(live_turn.get("model", "") or fallback_mw.current_model or "unknown")
     events = list(live_turn.get("events") or [])
     tracked_agents = list(live_turn.get("agents") or [])
+    _sa_role_counters: dict[str, int] = {}
+    for row in tracked_agents:
+        agent_type = str(row.get("type", "general") or "general")
+        try:
+            ordinal = int(row.get("ordinal") or 0)
+        except Exception:
+            ordinal = 0
+        _sa_role_counters[agent_type] = max(_sa_role_counters.get(agent_type, 0), ordinal)
     thread_id = str(st.session_state.get("_last_query_thread_id", "") or "")
+    working_dir = str(st.session_state.get("_active_query_workdir", "") or Path.cwd())
     config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
 
     def _capture_async_tasks() -> list[dict]:
@@ -1207,6 +1467,23 @@ def _resume_async_monitoring(
             unfinished.append(row)
         return unfinished
 
+    def _pause_for_human_review_if_needed() -> bool:
+        if st.session_state.get("_pending_human_review"):
+            return True
+        if st.session_state.get("_human_review_resolution") is not None:
+            return False
+        candidates = _parse_remember_candidates_from_history(tracked_agents, working_dir)
+        if not candidates:
+            return False
+        st.session_state["_pending_human_review"] = {
+            "status": "pending",
+            "workdir": working_dir,
+            "candidates": candidates,
+        }
+        _sync_live(True)
+        st.rerun()
+        return True
+
     def _maybe_schedule_alternate_subagent() -> None:
         for row in tracked_agents:
             if row.get("status") not in {"blocked", "failed"} or row.get("alternate_attempted"):
@@ -1301,10 +1578,23 @@ def _resume_async_monitoring(
         time.sleep(0.05)
         st.rerun()
 
+    if _pause_for_human_review_if_needed():
+        return False
+
     _evt("🧩", "All async subagents finished. Collecting results into one final answer", "subagent")
     try:
         loop_guard.reset()
         completed_report = _build_completed_subagent_report(tracked_agents)
+        human_review = st.session_state.pop("_human_review_resolution", None)
+        human_review_note = ""
+        if human_review:
+            human_review_note = (
+                "\n\nHuman review resolution:\n"
+                f"- approved={human_review.get('approved')}\n"
+                f"- layer={human_review.get('target_layer', '')}\n"
+                f"- selected_paths={human_review.get('selected_paths', [])}\n"
+                f"- stored_ids={human_review.get('stored_ids', [])}\n"
+            )
         _evt("📦", "Completed SubAgent results prepared for Main Agent aggregation", "subagent")
         result = agent.invoke(
             {
@@ -1314,7 +1604,7 @@ def _resume_async_monitoring(
                             "All async subagent tasks from this user turn should now be finished. "
                             "Below is the completed SubAgent result ledger gathered by the WebUI runtime. "
                             "Use it as the primary aggregation source, and use live async task tools only if you need to verify details.\n\n"
-                            f"{completed_report}\n\n"
+                            f"{completed_report}{human_review_note}\n\n"
                             "then produce one final synthesized answer for the user. "
                             "Do not launch new async tasks unless absolutely required."
                         )
@@ -1388,6 +1678,7 @@ def _stream_response(
     history_snapshot_saved = False
     stream_cutoff_for_async = False
     last_subagent_poll_at = 0.0
+    launched_async = False
 
     # Local SubAgent tracking — 질의별 독립
     tracked_agents: list[dict] = []
@@ -2116,6 +2407,63 @@ def _stream_response(
         """
         return list(tracked_agents)
 
+    def _pause_for_human_review_if_needed() -> bool:
+        if st.session_state.get("_pending_human_review"):
+            return True
+        if st.session_state.get("_human_review_resolution") is not None:
+            return False
+        candidates = _parse_remember_candidates_from_history(tracked_agents, working_dir)
+        if not candidates:
+            return False
+        st.session_state["_pending_human_review"] = {
+            "status": "pending",
+            "workdir": working_dir,
+            "candidates": candidates,
+        }
+        st.session_state["_monitor_async_after_answer"] = True
+        _sync_live_turn_state(working=True)
+        st.rerun()
+        return True
+
+    def _maybe_force_remember_subagent() -> bool:
+        if not _workspace_has_artifacts(working_dir):
+            return False
+        existing = [
+            row for row in tracked_agents
+            if str(row.get("type", "")).lower() == "remember"
+            and str(row.get("status", "")).lower() not in {"failed", "cancelled"}
+        ]
+        if existing:
+            return False
+        _evt(
+            "🧠",
+            "Artifacts detected. Forcing a remember subagent to nominate memory candidates before finalizing this turn",
+            "subagent",
+            refresh=False,
+        )
+        try:
+            agent.invoke(
+                {
+                    "messages": [
+                        HumanMessage(
+                            content=(
+                                "The current user turn produced durable workspace artifacts. "
+                                "You must now launch exactly one async `remember` subagent with `start_async_task`. "
+                                "Its job is to inspect the current query workspace, nominate up to 10 files worth long-term memory, "
+                                "and explain briefly why each one matters. Do not finalize the user turn yet."
+                            )
+                        )
+                    ]
+                },
+                config=config,
+            )
+            _drain_runtime_events(refresh=True)
+            _poll_subagent_outputs()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _evt("⚠️", f"Failed to launch remember subagent: {_escape_html(str(exc))}", "error", refresh=False)
+            return False
+
     def _refresh(working: bool, result: str = "", model: str = "") -> None:
         agents = _agents_state()
         _sync_live_turn_state(working=working)
@@ -2363,6 +2711,7 @@ def _stream_response(
                                 name = _tool_call_value(tc, "name", "unknown")
                                 args = _tool_call_value(tc, "args", {}) or {}
                                 if _is_subagent_spawn_tool(name):
+                                    launched_async = True
                                     atype, full_desc = _subagent_args(name, args)
                                     desc = _escape_html(full_desc[:60])
                                     # Track locally so Mermaid shows it immediately
@@ -2458,6 +2807,7 @@ def _stream_response(
                         })
 
                         if _is_subagent_spawn_tool(tool_name):
+                            launched_async = True
                             if tracked_idx is None:
                                 tracked_idx = _track_spawn("general", f"{tool_name} result")
                             sa_type = (
@@ -2579,6 +2929,12 @@ def _stream_response(
                 refresh=False,
             )
         unfinished = _unfinished_async_tasks()
+        if launched_async and not unfinished:
+            grace_deadline = time.time() + 2.0
+            while time.time() < grace_deadline and not unfinished:
+                _poll_subagent_outputs()
+                time.sleep(0.1)
+                unfinished = _unfinished_async_tasks()
         last_wait_count = -1
         while unfinished:
             if _is_refresh_requested():
@@ -2617,17 +2973,46 @@ def _stream_response(
             time.sleep(SUBAGENT_POLL_INTERVAL_SECONDS)
             unfinished = _unfinished_async_tasks()
 
+        if not unfinished and _maybe_force_remember_subagent():
+            had_async_subagents = True
+            unfinished = _unfinished_async_tasks()
+            while unfinished:
+                if len(unfinished) != last_wait_count:
+                    _evt(
+                        "⏳",
+                        f"Waiting for {len(unfinished)} async task(s) to finish before closing this user session",
+                        "subagent",
+                        refresh=False,
+                    )
+                    last_wait_count = len(unfinished)
+                _poll_subagent_outputs()
+                time.sleep(SUBAGENT_POLL_INTERVAL_SECONDS)
+                unfinished = _unfinished_async_tasks()
+
+        if _pause_for_human_review_if_needed():
+            return False
+
         if had_async_subagents and not unfinished:
             _evt("🧩", "All async subagents finished. Collecting results into one final answer", "subagent", refresh=False)
             _render_agent_status("Collecting completed async task results...")
             completed_report = _build_completed_subagent_report(tracked_agents)
+            human_review = st.session_state.pop("_human_review_resolution", None)
+            human_review_note = ""
+            if human_review:
+                human_review_note = (
+                    "\n\nHuman review resolution:\n"
+                    f"- approved={human_review.get('approved')}\n"
+                    f"- layer={human_review.get('target_layer', '')}\n"
+                    f"- selected_paths={human_review.get('selected_paths', [])}\n"
+                    f"- stored_ids={human_review.get('stored_ids', [])}\n"
+                )
             _evt("📦", "Completed SubAgent results prepared for Main Agent aggregation", "subagent", refresh=False)
             _evt("🧾", f"Aggregation ledger size: {len(completed_report):,} chars", "subagent", refresh=False)
             followup = (
                 "All async subagent tasks from this user turn should now be finished. "
                 "Below is the completed SubAgent result ledger gathered by the WebUI runtime. "
                 "Use it as the primary aggregation source, and use live async task tools only if you need to verify details.\n\n"
-                f"{completed_report}\n\n"
+                f"{completed_report}{human_review_note}\n\n"
                 "then produce one final synthesized answer for the user. "
                 "Do not launch new async tasks unless absolutely required."
             )
@@ -2947,6 +3332,83 @@ def render_chat() -> None:
                     else:
                         st.caption("Workspace is empty or unavailable.")
 
+                if msg_workdir and st.toggle(
+                    "Remember Review",
+                    key=f"_show_remember_review_hist_{_assistant_idx}",
+                    value=False,
+                ):
+                    if "remember_candidates" not in msg:
+                        remember_candidates = _parse_remember_candidates_from_history(
+                            msg.get("subagent_history_snapshot") or [],
+                            msg_workdir,
+                        )
+                        if not remember_candidates:
+                            remember_candidates = _select_remember_candidates(msg_workdir)
+                        msg["remember_candidates"] = remember_candidates
+                    msg.setdefault("remember_review_status", "pending")
+                    candidates = msg.get("remember_candidates") or []
+                    if not candidates:
+                        st.caption("remember agent did not find any strong memory candidates in this workspace.")
+                    else:
+                        source = "remember subagent" if any(row.get("source") == "remember_subagent" for row in candidates) else "workspace heuristic fallback"
+                        st.caption(f"Candidate source: {source}. Only this review path uses Human in the Loop.")
+                        for row in candidates:
+                            hist_cols = st.columns([6, 2])
+                            with hist_cols[0]:
+                                st.markdown(
+                                    f"**{_escape_html(str(row.get('path', '')))}**  \n"
+                                    f"<span style='color:#64748b;font-size:.86em'>{_escape_html(str(row.get('reason', '')))}</span>",
+                                    unsafe_allow_html=True,
+                                )
+                            with hist_cols[1]:
+                                file_bytes = _read_workspace_file_bytes(msg_workdir, str(row.get("path", "") or ""))
+                                if file_bytes:
+                                    st.download_button(
+                                        "Download",
+                                        data=file_bytes,
+                                        file_name=Path(str(row.get('path', 'artifact'))).name,
+                                        mime="application/octet-stream",
+                                        key=f"hist_remember_download_{_assistant_idx}_{row.get('path', '')}",
+                                        use_container_width=True,
+                                    )
+                        default_selection = [row["path"] for row in candidates[: min(5, len(candidates))]]
+                        with st.form(f"remember_review_form_{_assistant_idx}"):
+                            selected_paths = st.multiselect(
+                                "Approve files for long-term memory",
+                                options=[row["path"] for row in candidates],
+                                default=msg.get("remember_selected_paths", default_selection),
+                                format_func=lambda p: next(
+                                    (
+                                        f"{row['path']} · {row['reason']}"
+                                        for row in candidates if row["path"] == p
+                                    ),
+                                    p,
+                                ),
+                            )
+                            target_layer = st.selectbox(
+                                "Memory Layer",
+                                options=["project/context", "domain/knowledge", "user/profile"],
+                                index=["project/context", "domain/knowledge", "user/profile"].index(
+                                    str(msg.get("remember_target_layer", "project/context"))
+                                ),
+                            )
+                            approve = st.form_submit_button("Approve Selected for Memory", use_container_width=True)
+                        if approve:
+                            stored_ids = _store_approved_memory_files(msg_workdir, selected_paths, target_layer)
+                            msg["remember_selected_paths"] = list(selected_paths)
+                            msg["remember_target_layer"] = target_layer
+                            msg["remember_review_status"] = "approved"
+                            msg["remember_record_ids"] = stored_ids
+                            if stored_ids:
+                                st.success(f"Stored {len(stored_ids)} approved file(s) into long-term memory.")
+                            else:
+                                st.warning("No files were stored. Check whether the selected files still exist.")
+                        elif msg.get("remember_review_status") == "approved":
+                            st.success(
+                                f"Approved files stored: {len(msg.get('remember_record_ids', []) or [])} · "
+                                f"layer={msg.get('remember_target_layer', 'project/context')}"
+                            )
+
                 if msg.get("mermaid_def"):
                     _hist_html = msg.get("mermaid_html") or _build_page_html(
                         msg["mermaid_def"],
@@ -3086,6 +3548,8 @@ def render_chat() -> None:
                 else:
                     subagent_ph_ref["ph"] = st.empty()
 
+                _render_live_remember_review()
+
             prompt_display = live_prompt or pending or "(processing…)"
             st.markdown(
                 f"<div class='user-bubble-label'>👤 User</div>"
@@ -3103,7 +3567,11 @@ def render_chat() -> None:
         if not raw or st.session_state.get("_is_running"):
             return
         matched_label = next(
-            (label for label, prompt_text in TEST_PROMPTS.items() if prompt_text == raw),
+            (
+                label
+                for label, prompt_text in {**TEST_PROMPTS, **SCENARIO_PROMPTS}.items()
+                if prompt_text == raw
+            ),
             None,
         )
         st.session_state["_active_test_prompt_label"] = matched_label
@@ -3116,7 +3584,11 @@ def render_chat() -> None:
             unsafe_allow_html=True,
         )
 
-        show_test_prompts = st.toggle("Test Prompt", key="_show_test_prompts", value=False)
+        show_test_prompts = st.toggle(
+            "Input Test Prompt (Module Function Test)",
+            key="_show_test_prompts",
+            value=False,
+        )
         if show_test_prompts:
             st.markdown(
                 "<div style='background:#fff;padding:4px 0 2px'>",
@@ -3156,6 +3628,53 @@ def render_chat() -> None:
                 if use_clicked:
                     st.session_state["_preset_prompt"] = TEST_PROMPTS[pills_value]
                     st.session_state["_active_test_prompt_label"] = pills_value
+                    st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        show_test_scenarios = st.toggle(
+            "Input Test Scenario",
+            key="_show_test_scenarios",
+            value=False,
+        )
+        if show_test_scenarios:
+            st.markdown(
+                "<div style='background:#fff;padding:4px 0 2px'>",
+                unsafe_allow_html=True,
+            )
+            scenario_labels = list(SCENARIO_PROMPTS.keys())
+            scenario_value = None
+            if hasattr(st, "pills"):
+                scenario_value = st.pills(
+                    "Input Test Scenario",
+                    options=scenario_labels,
+                    selection_mode="single",
+                    label_visibility="collapsed",
+                    disabled=is_running,
+                    key="_test_scenario_pills",
+                )
+            else:
+                scenario_value = st.radio(
+                    "Input Test Scenario",
+                    options=scenario_labels,
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    disabled=is_running,
+                    key="_test_scenario_radio",
+                )
+
+            if scenario_value:
+                st.caption(SCENARIO_PROMPT_DETAILS.get(scenario_value, ""))
+                apply_col, _ = st.columns([1, 8])
+                with apply_col:
+                    use_scenario_clicked = st.button(
+                        "Use",
+                        key=f"use_test_scenario_{scenario_value}",
+                        disabled=is_running,
+                        use_container_width=True,
+                    )
+                if use_scenario_clicked:
+                    st.session_state["_preset_prompt"] = SCENARIO_PROMPTS[scenario_value]
+                    st.session_state["_active_test_prompt_label"] = scenario_value
                     st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -3216,6 +3735,8 @@ def render_chat() -> None:
             if not st.session_state.get("_monitor_async_after_answer"):
                 # 실행 완료 후 rerun → 입력창 활성화
                 st.rerun()
+    elif st.session_state.get("_pending_human_review"):
+        st.session_state["_is_running"] = True
     elif st.session_state.get("_monitor_async_after_answer"):
         st.session_state["_is_running"] = True
         _resume_async_monitoring(graph_ph, result_ph_ref["ph"], subagent_ph_ref["ph"])

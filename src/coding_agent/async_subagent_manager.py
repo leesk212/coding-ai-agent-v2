@@ -105,6 +105,17 @@ DEFAULT_ASYNC_SUBAGENTS: dict[str, dict[str, Any]] = {
         "graph_id": "reviewer",
         "transport": "http",
     },
+    "remember": {
+        "description": "Memory curation agent for selecting durable project artifacts worth storing in long-term memory.",
+        "system_prompt": (
+            "You are a memory curation specialist. Inspect the final project artifacts in the current working directory, "
+            "identify up to 10 files that are most valuable for future reuse or recall, and explain briefly why each one "
+            "should be remembered. Prefer PRD, specs, architecture decisions, important implementation files, API contracts, "
+            "and tests that encode durable project knowledge."
+        ),
+        "graph_id": "remember",
+        "transport": "http",
+    },
     "debugger": {
         "description": "Debugging agent for reproduction, diagnosis, and targeted fixes.",
         "system_prompt": (

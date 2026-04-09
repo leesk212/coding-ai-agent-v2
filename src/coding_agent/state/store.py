@@ -179,6 +179,32 @@ class DurableStateStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def list_memory_records(
+        self,
+        *,
+        layer: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if layer:
+            clauses.append("layer = ?")
+            params.append(layer)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = (
+            "SELECT * FROM memory_records "
+            f"{where} "
+            "ORDER BY updated_at DESC LIMIT ?"
+        )
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
     def create_subagent(
         self,
         *,
