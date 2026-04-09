@@ -5,7 +5,7 @@ Usage:
 
 Built on DeepAgents CLI with custom extensions for:
 - Long-term memory (ChromaDB)
-- Dynamic sub-agents
+- DeepAgents AsyncSubAgent orchestration
 - Model fallback (OpenRouter open-source -> Ollama local)
 """
 
@@ -52,7 +52,7 @@ def print_banner() -> None:
     banner.append("Coding AI Agent", style="bold cyan")
     banner.append(" v0.2.0\n", style="dim")
     banner.append(
-        "DeepAgents CLI + Long-Term Memory + Dynamic SubAgents + Model Fallback\n",
+        "DeepAgents CLI + Long-Term Memory + AsyncSubAgent Orchestration + Model Fallback\n",
         style="dim",
     )
 
@@ -116,7 +116,7 @@ async def run_agent_loop(agent_components: dict) -> None:
             continue
 
         if user_input.lower() == "/subagents":
-            sa_mw = agent_components["subagent_middleware"]
+            sa_mw = agent_components["subagent_runtime"]
             proc_rows = sa_mw.get_all_tasks()
             if proc_rows:
                 console.print("[bold]Processes[/bold]")
@@ -146,27 +146,43 @@ async def run_agent_loop(agent_components: dict) -> None:
 
             with console.status("[bold cyan]Thinking...[/bold cyan]"):
                 response_text = ""
-                async for event in agent.astream_events(
-                    inputs, config=config, version="v2"
-                ):
-                    kind = event.get("event", "")
+                if hasattr(agent, "astream_events"):
+                    async for event in agent.astream_events(
+                        inputs, config=config, version="v2"
+                    ):
+                        kind = event.get("event", "")
 
-                    if kind == "on_chat_model_stream":
-                        chunk = event.get("data", {}).get("chunk")
-                        if chunk and hasattr(chunk, "content") and chunk.content:
-                            content = chunk.content
-                            if isinstance(content, str):
+                        if kind == "on_chat_model_stream":
+                            chunk = event.get("data", {}).get("chunk")
+                            if chunk and hasattr(chunk, "content") and chunk.content:
+                                content = chunk.content
+                                if isinstance(content, str):
+                                    console.print(content, end="")
+                                    response_text += content
+
+                        elif kind == "on_tool_start":
+                            tool_name = event.get("name", "unknown")
+                            console.print(
+                                f"\n[dim cyan]> Tool: {tool_name}[/dim cyan]", end=""
+                            )
+
+                        elif kind == "on_tool_end":
+                            console.print(" [dim green]done[/dim green]")
+                else:
+                    for namespace, mode, data in agent.stream(
+                        inputs,
+                        config=config,
+                        stream_mode=["messages", "updates"],
+                        subgraphs=True,
+                    ):
+                        if namespace:
+                            continue
+                        if mode == "messages" and isinstance(data, tuple) and len(data) == 2:
+                            message, _metadata = data
+                            content = getattr(message, "content", "")
+                            if isinstance(content, str) and content:
                                 console.print(content, end="")
                                 response_text += content
-
-                    elif kind == "on_tool_start":
-                        tool_name = event.get("name", "unknown")
-                        console.print(
-                            f"\n[dim cyan]> Tool: {tool_name}[/dim cyan]", end=""
-                        )
-
-                    elif kind == "on_tool_end":
-                        console.print(" [dim green]done[/dim green]")
 
                 console.print()
 
@@ -229,11 +245,11 @@ def main() -> None:
     print_banner()
 
     try:
-        from coding_agent.agent import create_coding_agent
+        from coding_agent.runtime import create_runtime_components
 
-        components = create_coding_agent()
-        with console.status("[bold cyan]Starting local async subagents...[/bold cyan]"):
-            components["subagent_manager"].ensure_all_started()
+        components = create_runtime_components()
+        with console.status("[bold cyan]Preparing AsyncSubAgent runtimes...[/bold cyan]"):
+            components["subagent_runtime"].ensure_all_started()
     except Exception as e:
         console.print(f"[red]Failed to initialize agent: {e}[/red]")
         logger.exception("Init failed")

@@ -20,7 +20,7 @@ class CodeReviewPromptTests(unittest.TestCase):
 
     def test_code_review_prompt_mentions_writer_and_reviewer(self) -> None:
         prompt = TEST_PROMPTS["Code+Review Test"].lower()
-        self.assertIn("code_writer", prompt)
+        self.assertIn("coder", prompt)
         self.assertIn("reviewer", prompt)
         self.assertIn("launch two async tasks", prompt)
         self.assertIn("collect", prompt)

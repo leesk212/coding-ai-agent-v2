@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from langchain.agents.middleware.types import AgentMiddleware
 
+from coding_agent.middleware._system_message import append_system_message
+
 
 COMPLETION_POLICY_PROMPT = """
 ## Async Task Completion Policy (project override)
@@ -27,7 +29,7 @@ class AsyncTaskCompletionMiddleware(AgentMiddleware):
 
     def _inject_policy(self, request):
         current_system = getattr(request, "system_message", "") or ""
-        new_system = f"{current_system}\n\n{COMPLETION_POLICY_PROMPT}".strip()
+        new_system = append_system_message(current_system, COMPLETION_POLICY_PROMPT)
         try:
             return request.override(system_message=new_system)
         except (AttributeError, TypeError):

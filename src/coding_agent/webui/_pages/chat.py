@@ -28,7 +28,7 @@ from langchain_core.messages import HumanMessage
 logger = logging.getLogger(__name__)
 
 AGENT_ICONS = {
-    "code_writer": "✍️", "researcher": "🔍", "reviewer": "📋",
+    "coder": "✍️", "code_writer": "✍️", "researcher": "🔍", "reviewer": "📋",
     "debugger": "🐛", "general": "🤖",
 }
 
@@ -36,7 +36,7 @@ TEST_PROMPTS = {
     "Async Launch": (
         "Launch two async tasks: "
         "1) a researcher to investigate best practices for Python error handling, "
-        "2) a code_writer to draft an example implementation. "
+        "2) a coder to draft an example implementation. "
         "Report the task IDs and stop after launching."
     ),
     "Memory Test": (
@@ -49,7 +49,7 @@ TEST_PROMPTS = {
     ),
     "Code+Review Test": (
         "Launch two async tasks, collect their completed results in this same response, and synthesize final output: "
-        "1) code_writer to implement a fibonacci function with type hints and docstring, "
+        "1) coder to implement a fibonacci function with type hints and docstring, "
         "2) reviewer to review correctness, edge cases, and test coverage gaps."
     ),
     "Fallback Test": "Write a simple hello world in Python",
@@ -686,6 +686,21 @@ def _stream_response(
         if metadata and metadata.get("lc_source") == "summarization":
             return ""
 
+        if isinstance(message, dict):
+            content = message.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_parts.append(str(block.get("text", "")))
+                        elif "text" in block:
+                            text_parts.append(str(block.get("text", "")))
+                return "".join(text_parts)
+            return str(content) if content else ""
+
         blocks = getattr(message, "content_blocks", None)
         if blocks:
             text_parts: list[str] = []
@@ -709,6 +724,23 @@ def _stream_response(
         if isinstance(tool_call, dict):
             return tool_call.get(key, default)
         return getattr(tool_call, key, default)
+
+    def _msg_value(msg, key: str, default=None):
+        if isinstance(msg, dict):
+            return msg.get(key, default)
+        return getattr(msg, key, default)
+
+    def _msg_type(msg) -> str | None:
+        return _msg_value(msg, "type")
+
+    def _msg_content(msg):
+        return _msg_value(msg, "content", "")
+
+    def _msg_tool_calls(msg):
+        return _msg_value(msg, "tool_calls", []) or []
+
+    def _msg_name(msg) -> str:
+        return str(_msg_value(msg, "name", "unknown"))
 
     def _is_subagent_spawn_tool(tool_name: str) -> bool:
         return tool_name == "start_async_task"
@@ -898,16 +930,18 @@ def _stream_response(
             _evt("⚠️", "Agent lacks .stream() — using non-streaming invoke", "tool")
             result = agent.invoke(inputs, config=config)
             for msg in result.get("messages", []):
-                if getattr(msg, "type", None) == "ai" and msg.content:
+                if _msg_type(msg) == "ai" and _msg_content(msg):
+                    content = _msg_content(msg)
                     final_text = (
-                        msg.content if isinstance(msg.content, str)
-                        else str(msg.content)
+                        content if isinstance(content, str)
+                        else str(content)
                     )
-                elif getattr(msg, "type", None) == "tool":
-                    tname = getattr(msg, "name", "?")
+                elif _msg_type(msg) == "tool":
+                    tname = _msg_name(msg)
+                    content = _msg_content(msg)
                     tools_used.append({
                         "name": tname,
-                        "result": str(msg.content)[:200] if msg.content else "",
+                        "result": str(content)[:200] if content else "",
                         "is_subagent": _is_subagent_tool(tname),
                     })
                     _evt("🔧", f"Tool <b>{tname}</b> executed", "tool")
@@ -1001,7 +1035,7 @@ def _stream_response(
                 if not isinstance(chunk_data, tuple) or len(chunk_data) != 2:
                     continue
                 message, metadata = chunk_data
-                msg_type = getattr(message, "type", None)
+                msg_type = _msg_type(message)
                 if msg_type == "AIMessageChunk" or "AIMessageChunk" in type(message).__name__ or msg_type == "ai":
                     text_delta = _message_text_delta(message, metadata)
                     if text_delta:
@@ -1047,10 +1081,10 @@ def _stream_response(
                     raw_msgs = [raw_msgs] if raw_msgs else []
 
                 for msg in raw_msgs:
-                    msg_type = getattr(msg, "type", None)
+                    msg_type = _msg_type(msg)
 
                     if msg_type == "ai":
-                        tool_calls = getattr(msg, "tool_calls", [])
+                        tool_calls = _msg_tool_calls(msg)
                         if tool_calls:
                             for tc in tool_calls:
                                 name = _tool_call_value(tc, "name", "unknown")
@@ -1116,9 +1150,9 @@ def _stream_response(
                                     _evt("🔧", f"Calling <b>{name}</b>({_escape_html(arg_summary)})", "tool")
 
                         content = (
-                            msg.content
-                            if isinstance(msg.content, str)
-                            else str(msg.content) if msg.content
+                            _msg_content(msg)
+                            if isinstance(_msg_content(msg), str)
+                            else str(_msg_content(msg)) if _msg_content(msg)
                             else ""
                         )
                         if content and not tool_calls:
@@ -1137,11 +1171,12 @@ def _stream_response(
                             return True
 
                     elif msg_type == "tool":
-                        tool_name = getattr(msg, "name", "unknown")
-                        tool_call_id = getattr(msg, "tool_call_id", None)
+                        tool_name = _msg_name(msg)
+                        tool_call_id = _msg_value(msg, "tool_call_id", None)
                         tracked_idx = tool_call_agents.get(str(tool_call_id)) if tool_call_id else None
                         action = tool_call_actions.get(str(tool_call_id), "")
-                        tool_content_full = str(msg.content) if msg.content else ""
+                        msg_content = _msg_content(msg)
+                        tool_content_full = str(msg_content) if msg_content else ""
                         tool_content = tool_content_full[:300]
                         is_sa = _is_subagent_tool(tool_name)
                         tools_used.append({
@@ -1266,11 +1301,12 @@ def _stream_response(
             try:
                 state = agent.get_state(config)
                 for msg in reversed(state.values.get("messages", [])):
-                    if getattr(msg, "type", None) == "ai" and msg.content:
+                    if _msg_type(msg) == "ai" and _msg_content(msg):
+                        content = _msg_content(msg)
                         final_text = (
-                            msg.content
-                            if isinstance(msg.content, str)
-                            else str(msg.content)
+                            content
+                            if isinstance(content, str)
+                            else str(content)
                         )
                         if not streamed_text:
                             streamed_text = final_text

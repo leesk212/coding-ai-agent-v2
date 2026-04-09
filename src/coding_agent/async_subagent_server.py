@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from deepagents import create_deep_agent
 from fastapi import FastAPI, HTTPException, Request
 from langchain_core.messages import HumanMessage
 
@@ -31,6 +32,7 @@ _CONN.row_factory = sqlite3.Row
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local async subagent server")
     parser.add_argument("--agent-type", required=True)
+    parser.add_argument("--graph-id", default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--root-dir", required=True)
@@ -86,7 +88,6 @@ def _bootstrap_agent():
     if _ARGS is None:
         raise RuntimeError("Server arguments were not initialized.")
 
-    from deepagents import create_deep_agent
     from deepagents.backends import LocalShellBackend
 
     model_spec = next(
@@ -111,7 +112,7 @@ def _bootstrap_agent():
         memory=[],
         skills=[],
         debug=False,
-        name=f"async-subagent-{_ARGS.agent_type}",
+        name=str(_ARGS.graph_id or _ARGS.agent_type),
     )
 
 
@@ -210,7 +211,7 @@ async def create_run(thread_id: str, request: Request) -> dict[str, Any]:
 
     run_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
-    assistant_id = body.get("assistant_id") or (_ARGS.agent_type if _ARGS else "async-subagent")
+    assistant_id = body.get("assistant_id") or (_ARGS.graph_id or _ARGS.agent_type if _ARGS else "async-subagent")
     _CONN.execute(
         "INSERT INTO runs (run_id, thread_id, assistant_id, created_at) VALUES (?, ?, ?, ?)",
         (run_id, thread_id, assistant_id, now),

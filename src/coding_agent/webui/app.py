@@ -102,13 +102,15 @@ def _init_agent():
 
             t0 = time.time()
             log("🏗️", "Creating DeepAgents supervisor...", 55)
-            from coding_agent.agent import create_coding_agent
-            components = create_coding_agent(cwd=Path.cwd())
+            from coding_agent.runtime import create_runtime_components
+            components = create_runtime_components(cwd=Path.cwd())
             log("✅", f"DeepAgents supervisor ready — {time.time()-t0:.1f}s", 90)
+            topo = components.get("deployment_topology", "unknown")
+            log("🧭", f"Topology: {topo}", 91)
 
             t0 = time.time()
-            log("🤖", "Starting local async subagent processes...", 92)
-            manager = components["subagent_manager"]
+            log("🤖", "Preparing DeepAgents AsyncSubAgent runtimes...", 92)
+            manager = components["subagent_runtime"]
             specs = manager.ensure_all_started()
             log("✅", f"Async subagents healthy ({len(specs)}) — {time.time()-t0:.1f}s", 97)
 

@@ -81,6 +81,15 @@ class Settings:
     max_subagents: int = field(
         default_factory=lambda: int(os.getenv("MAX_SUBAGENTS", "3"))
     )
+    deployment_topology: str = field(
+        default_factory=lambda: os.getenv("DEEPAGENTS_DEPLOYMENT_TOPOLOGY", "single")
+    )
+    langgraph_deployment_url: str = field(
+        default_factory=lambda: os.getenv("LANGGRAPH_DEPLOYMENT_URL", "")
+    )
+    langgraph_assistant_id: str = field(
+        default_factory=lambda: os.getenv("LANGGRAPH_ASSISTANT_ID", "supervisor")
+    )
     async_subagent_host: str = field(
         default_factory=lambda: os.getenv("ASYNC_SUBAGENT_HOST", "127.0.0.1")
     )

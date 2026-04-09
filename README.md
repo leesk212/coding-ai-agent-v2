@@ -1,12 +1,19 @@
 # Coding AI Agent v2
 
 DeepAgents v0.5 기반의 코딩 에이전트입니다.
-메인 Supervisor는 `create_deep_agent()`로 구성되고, SubAgent는 **로컬 PC에서 타입별 독립 프로세스**로 실행됩니다.
+이 프로젝트는 이제 공식 `AsyncSubAgent` 패턴을 기준으로 재구성되어,
+
+- `deepagents.AsyncSubAgent(...)`
+- `deepagents.create_deep_agent(...)`
+- `langgraph.json` graph registry
+
+를 중심으로 동작합니다.
 
 핵심 목표:
-- `create_deep_agent` 중심 아키텍처
-- `AsyncSubAgent` 기반 백그라운드 작업
-- SubAgent 프로세스 관리 + Task 상태 추적 + 결과 취합
+- 공식 DeepAgents async-subagent 패턴 사용
+- `single / split / hybrid` deployment topology 지원
+- Supervisor + specialist graph 분리
+- WebUI/CLI와 LangGraph deployment 실행 경로를 모두 지원
 
 ## Architecture
 
@@ -22,20 +29,25 @@ DeepAgents v0.5 기반의 코딩 에이전트입니다.
 │  - AsyncOnlySubagentsMiddleware (sync task tool 차단)           │
 │  - Async task tools: start/check/update/cancel/list             │
 └──────────────────────────────┬──────────────────────────────────┘
-                               │ Agent Protocol (HTTP)
-             ┌─────────────────┼─────────────────┐
-             │                 │                 │
-┌────────────▼───────┐ ┌──────▼──────────┐ ┌────▼──────────────┐
-│ researcher process │ │ code_writer proc │ │ reviewer/debugger │
-│ FastAPI server     │ │ FastAPI server   │ │ FastAPI servers   │
-│ create_deep_agent  │ │ create_deep_agent│ │ create_deep_agent │
-└────────────────────┘ └──────────────────┘ └───────────────────┘
+                               │
+              ┌────────────────┴────────────────┐
+              │                                 │
+      single topology                    split / hybrid topology
+      (ASGI co-deploy)                   (HTTP Agent Protocol)
+              │                                 │
+   ┌──────────┼──────────┐             ┌────────┼────────┐
+   │          │          │             │        │        │
+ researcher  coder    reviewer      researcher coder  reviewer/debugger
+ debugger    graphs    graphs        local servers or remote deployments
 ```
 
 ## 주요 기능
 
 - `create_deep_agent` Supervisor 구성
-- SubAgent 타입별 독립 프로세스 실행 (`researcher`, `code_writer`, `reviewer`, `debugger`)
+- `AsyncSubAgent` spec 기반 subagent 구성 (`researcher`, `coder`, `reviewer`, `debugger`)
+- `langgraph.json` graph registry 제공
+- 공식 single deployment(ASGI) 경로 제공
+- standalone WebUI/CLI용 split deployment(HTTP) 경로 제공
 - Async Task 도구 기반 상태 관리
 - `async_tasks` state 추적기 제공 (`AsyncTaskTracker`)
 - ChromaDB 장기 메모리 (`memory_store`, `memory_search`)
@@ -77,13 +89,24 @@ python -m coding_agent --webui
 
 동작:
 - 초기화 시 Main Supervisor 생성
-- 로컬 Async SubAgent 프로세스 기동 및 health check
+- `DEEPAGENTS_DEPLOYMENT_TOPOLOGY=single` 이고 `LANGGRAPH_DEPLOYMENT_URL` 이 설정되어 있으면,
+  WebUI는 running `langgraph` deployment의 `supervisor` graph에 직접 연결됩니다.
+- 그렇지 않으면 standalone split topology로 로컬 AsyncSubAgent runtime을 기동합니다.
 - Chat에서 `start_async_task`/`check_async_task`/`list_async_tasks` 등으로 Task 운용
 
 ### 2) CLI 실행
 
 ```bash
 python -m coding_agent
+```
+
+single topology 예시:
+
+```bash
+export DEEPAGENTS_DEPLOYMENT_TOPOLOGY=single
+export LANGGRAPH_DEPLOYMENT_URL=http://127.0.0.1:2024
+export LANGGRAPH_ASSISTANT_ID=supervisor
+python -m coding_agent --webui
 ```
 
 CLI 명령:
@@ -108,19 +131,40 @@ python -m unittest discover -s tests -p "test_*.py"
 python -m unittest tests.test_code_review_workflow
 ```
 
+## LangGraph Deployment 실행
+
+공식 문서 권장 경로는 single deployment 입니다. 이 프로젝트는 이를 위해
+루트에 [`langgraph.json`](/mnt/c/Users/SDS/Subject/langgraph.json) 을 제공합니다.
+
+등록 graph:
+- `supervisor`
+- `researcher`
+- `coder`
+- `reviewer`
+- `debugger`
+
+예시:
+
+```bash
+langgraph dev --n-jobs-per-worker 10
+```
+
+이 경우 supervisor는 co-deployed subagent들을 `url` 없이 ASGI transport로 호출합니다.
+
 ## Async SubAgent 런타임 설정
 
 `Settings` 페이지 또는 환경 변수로 조정:
 
 | Variable | Description | Default |
 |---|---|---|
+| `DEEPAGENTS_DEPLOYMENT_TOPOLOGY` | `single`, `split`, `hybrid` | `single` |
 | `ASYNC_SUBAGENT_HOST` | 로컬 subagent 서버 bind host | `127.0.0.1` |
 | `ASYNC_SUBAGENT_BASE_PORT` | subagent 시작 포트(타입별 +1 증가) | `30240` |
 | `MAX_SUBAGENTS` | 동시 SubAgent 제한(정책 레벨) | `3` |
 
 예:
 - `researcher` -> `30240`
-- `code_writer` -> `30241`
+- `coder` -> `30241`
 - `reviewer` -> `30242`
 - `debugger` -> `30243`
 
@@ -138,8 +182,9 @@ python -m unittest tests.test_code_review_workflow
 ```text
 src/coding_agent/
 ├── agent.py                         # create_deep_agent supervisor assembly
-├── async_subagent_manager.py        # 타입별 로컬 subagent 프로세스 매니저
-├── async_subagent_server.py         # Agent Protocol FastAPI subagent 서버
+├── graphs.py                        # langgraph.json용 supervisor/subagent graph exports
+├── async_subagent_manager.py        # AsyncSubAgent spec + topology/runtime manager
+├── async_subagent_server.py         # split topology용 Agent Protocol subagent 서버
 ├── async_task_tracker.py            # async_tasks state 조회
 ├── config.py                        # 모델/런타임 설정
 ├── middleware/
@@ -153,7 +198,7 @@ src/coding_agent/
     ├── app.py
     └── _pages/
         ├── chat.py                  # Mermaid + streaming chat + task snapshot
-        ├── subagents.py             # 프로세스/태스크 모니터 + snapshot/live diff
+        ├── subagents.py             # runtime/태스크 모니터 + snapshot/live diff
         ├── memory.py
         └── settings.py
 ```
@@ -161,7 +206,8 @@ src/coding_agent/
 ## 현재 동작 요약
 
 - Main Agent는 async task 도구를 통해 백그라운드 작업을 시작합니다.
-- SubAgent 결과는 task ID 단위로 조회/업데이트/취소합니다.
+- 공식 DeepAgents `AsyncSubAgent` toolchain (`start/check/update/cancel/list`)을 사용합니다.
+- single topology에서는 co-deployed ASGI transport를, standalone WebUI/CLI에서는 split HTTP transport를 사용합니다.
 - WebUI는 conversation 단위 `thread_id`를 유지하고, Mermaid에 task 흐름을 반영합니다.
 - 각 assistant 결과는 `async_task_snapshot`을 함께 저장해 히스토리 시점 비교가 가능합니다.
 - 기본 정책은 "동일 질의 내 결과 취합"입니다. 별도 요청이 없으면 launch 후 `check_async_task`로 결과를 모아 최종 답변을 만듭니다.

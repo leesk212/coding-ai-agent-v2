@@ -1,4 +1,4 @@
-"""SubAgent process monitor."""
+"""DeepAgents AsyncSubAgent runtime monitor."""
 
 import time
 import streamlit as st
@@ -12,13 +12,13 @@ def render_subagents() -> None:
         st.warning("Agent not initialized. Check Settings.")
         return
 
-    sa_mw = components["subagent_middleware"]
+    sa_mw = components["subagent_runtime"]
     tracker = components.get("async_task_tracker")
     all_tasks = sa_mw.get_all_tasks()
     thread_id = st.session_state.get("_conversation_thread_id", "")
     tracked_tasks = tracker.get_tasks(thread_id) if tracker and thread_id else []
 
-    st.subheader("Local Async SubAgent Processes")
+    st.subheader("AsyncSubAgent Runtimes")
     active = [task for task in all_tasks if task["status"] == "running"]
 
     if not active:
@@ -38,15 +38,15 @@ def render_subagents() -> None:
     if not all_tasks:
         st.info("No subagent processes are configured.")
         st.markdown("""
-        Async subagents run as local Agent Protocol servers. Available types:
+        AsyncSubAgents run as DeepAgents specs backed by either local Agent Protocol
+        servers (`url=...`) or in-process ASGI transport (`url` omitted). Available types:
 
         | Type | Description |
         |------|-------------|
-        | `code_writer` | Writing new code or functions |
+        | `coder` | Writing new code or functions |
         | `researcher` | Investigating codebases, docs |
         | `reviewer` | Code review and quality analysis |
         | `debugger` | Root cause analysis, bug fixing |
-        | `general` | Any other task |
         """)
         return
 

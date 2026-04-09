@@ -1,0 +1,11 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "supervisor": "./src/coding_agent/graphs.py:supervisor",
+    "researcher": "./src/coding_agent/graphs.py:researcher",
+    "coder": "./src/coding_agent/graphs.py:coder",
+    "reviewer": "./src/coding_agent/graphs.py:reviewer",
+    "debugger": "./src/coding_agent/graphs.py:debugger"
+  },
+  "env": ".env"
+}

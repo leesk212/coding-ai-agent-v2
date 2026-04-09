@@ -97,6 +97,37 @@ def render_settings() -> None:
     st.markdown("---")
 
     # Agent Settings
+    st.subheader("🧭 Deployment")
+
+    topology = st.selectbox(
+        "Deployment Topology",
+        options=["single", "split", "hybrid"],
+        index=["single", "split", "hybrid"].index(settings.deployment_topology if settings.deployment_topology in {"single", "split", "hybrid"} else "single"),
+        help="single=langgraph co-deploy(ASGI), split=HTTP runtimes, hybrid=mixed",
+    )
+    settings.deployment_topology = topology
+
+    deployment_url = st.text_input(
+        "LangGraph Deployment URL",
+        value=settings.langgraph_deployment_url,
+        help="Required for single topology when WebUI/CLI should talk to a running langgraph deployment.",
+    )
+    if deployment_url != settings.langgraph_deployment_url:
+        settings.langgraph_deployment_url = deployment_url
+        os.environ["LANGGRAPH_DEPLOYMENT_URL"] = deployment_url
+
+    assistant_id = st.text_input(
+        "LangGraph Assistant ID",
+        value=settings.langgraph_assistant_id,
+        help="Usually `supervisor` for this project.",
+    )
+    if assistant_id != settings.langgraph_assistant_id:
+        settings.langgraph_assistant_id = assistant_id
+        os.environ["LANGGRAPH_ASSISTANT_ID"] = assistant_id
+
+    st.markdown("---")
+
+    # Agent Settings
     st.subheader("🔄 Agent Loop Defense")
 
     col1, col2 = st.columns(2)
@@ -180,6 +211,7 @@ def render_settings() -> None:
 
             fallback = components["fallback_middleware"]
             status = fallback.get_status()
+            st.caption(f"Topology: `{components.get('deployment_topology', settings.deployment_topology)}`")
 
             for m in status["models"]:
                 icon = (

@@ -19,6 +19,7 @@ from langchain_core.tools import tool
 
 from coding_agent.memory.categories import MemoryCategory
 from coding_agent.memory.store import LongTermMemory
+from coding_agent.middleware._system_message import append_system_message
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,7 @@ class LongTermMemoryMiddleware(AgentMiddleware):
         # Try to inject into system prompt
         try:
             current_system = getattr(request, "system_message", "") or ""
-            new_system = current_system + "\n\n" + memory_text
+            new_system = append_system_message(current_system, memory_text)
             modified_request = request.override(system_message=new_system)
             return handler(modified_request)
         except (AttributeError, TypeError):
@@ -134,7 +135,7 @@ class LongTermMemoryMiddleware(AgentMiddleware):
 
         try:
             current_system = getattr(request, "system_message", "") or ""
-            new_system = current_system + "\n\n" + memory_text
+            new_system = append_system_message(current_system, memory_text)
             modified_request = request.override(system_message=new_system)
             return await handler(modified_request)
         except (AttributeError, TypeError):

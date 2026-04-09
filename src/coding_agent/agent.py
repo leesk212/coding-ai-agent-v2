@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from deepagents import AsyncSubAgent, create_deep_agent
 from coding_agent.async_subagent_manager import LocalAsyncSubagentManager
 from coding_agent.async_task_tracker import AsyncTaskTracker
 from coding_agent.config import Settings, settings
@@ -108,14 +109,15 @@ def _setup_agents_md(agent_id: str = "coding-agent") -> list[str]:
 def create_coding_agent(
     custom_settings: Settings | None = None,
     cwd: Path | None = None,
+    *,
+    topology: str | None = None,
 ) -> dict[str, Any]:
-    """Create the main supervisor with DeepAgents `create_deep_agent`."""
+    """Create the main supervisor with DeepAgents AsyncSubAgent specs."""
 
     cfg = custom_settings or settings
     working_dir = (cwd or Path.cwd()).resolve()
 
     try:
-        from deepagents import create_deep_agent
         from deepagents.backends import LocalShellBackend
         from langgraph.checkpoint.memory import MemorySaver
     except ImportError as exc:  # pragma: no cover - dependency mismatch path
@@ -132,9 +134,13 @@ def create_coding_agent(
     async_only_mw = AsyncOnlySubagentsMiddleware()
     completion_mw = AsyncTaskCompletionMiddleware()
     loop_guard = AgentLoopGuard(max_iterations=cfg.max_iterations)
-    subagent_manager = LocalAsyncSubagentManager(cfg=cfg, root_dir=working_dir)
+    subagent_runtime = LocalAsyncSubagentManager(
+        cfg=cfg,
+        root_dir=working_dir,
+        topology=topology,
+    )
 
-    async_subagents = subagent_manager.get_async_subagent_specs()
+    async_subagents: list[AsyncSubAgent] = subagent_runtime.build_async_subagents()
     checkpointer = MemorySaver()
     backend = LocalShellBackend(
         root_dir=str(working_dir),
@@ -157,7 +163,7 @@ def create_coding_agent(
     )
 
     logger.info(
-        "Created DeepAgents supervisor with %d async subagent processes",
+        "Created DeepAgents supervisor with %d AsyncSubAgent specs",
         len(async_subagents),
     )
 
@@ -166,8 +172,11 @@ def create_coding_agent(
         "backend": backend,
         "fallback_middleware": fallback_mw,
         "memory_middleware": ltm_mw,
-        "subagent_middleware": subagent_manager,
-        "subagent_manager": subagent_manager,
+        "subagent_middleware": subagent_runtime,
+        "subagent_manager": subagent_runtime,
+        "subagent_runtime": subagent_runtime,
+        "deployment_topology": subagent_runtime.topology,
+        "async_subagents": async_subagents,
         "async_task_tracker": AsyncTaskTracker(agent),
         "loop_guard": loop_guard,
         "checkpointer": checkpointer,
