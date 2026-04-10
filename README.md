@@ -85,8 +85,8 @@ docker run -d \
 ### 2. 로컬 실행
 
 ```bash
-git clone https://github.com/leesk212/coding-ai-agent-v2.git
-cd coding-ai-agent-v2
+git clone https://github.com/leesk212/dannys-coding-ai-agent-final.git
+cd dannys-coding-ai-agent-final
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
