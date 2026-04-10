@@ -44,17 +44,25 @@
 
 
 ### 2. Code+Review (SubAgents)
-* SubAgents
+* Input Prompt :
+  ```
+  Handle this in one user turn. You must use async subagents via `start_async_task` and launch two async tasks. First launch a coder subagent to implement a fibonacci function with type hints and save it to a concrete Python file in the current query workspace. After the coder completes and the file path is known, launch a reviewer subagent to review that exact file for correctness, edge cases, and missing tests. Wait for both to finish, collect the completed results in the same response, and synthesize one final answer.
+  ```
+* SubAgents (동작 영상)
 [![Watch the video](https://img.youtube.com/vi/P3aDKMqmR_4/hqdefault.jpg)](https://www.youtube.com/watch?v=P3aDKMqmR_4)
-* Memory Check
+  * Memory Check  
   ![code+memory](https://github.com/user-attachments/assets/4fb50a1f-507e-4f1e-8d4b-c67f16aa5034)
 
 
 ### 3. Scenario (PMS시스템구성)
+* Input Prompt :
+  ```
+  ## TaskPMS (project manage system) 시스템을 구성하는 프로젝트.## Process1. PRD 파일을 만들고2. PRD 파일을 기반으로 작업을 원자 단위 작업으로 분해할 것.3. 작업에 대한 명세는 구체적이어야하며, 추상적인 문구를 배제하고 확실히 개발 방향을 명시할 것.4. 개발 명세서를 Spec Driven Development 기반으로 도출할 것.5. 위 내용으로 도출된 개발 명세서를 기반으로 개발 작업을 수행할 것.(단, Test Driven Development 방식으로 개발하는 것을 필히 준수해야함)## 세부 요구사항1. 사용자 : it 회사의 프로젝트을 수행하는 PM2. 관리자 : it 회사의 임원 및 PMO 조직3. 웹, 모바일에서 접속 가능4. 사용자는 프로젝트 정보를 입력한다. (프로젝트명, 프로젝트코드, 고객사, 설계자, 개발자, 프로젝트 일정)5. 관리자는 등록된 프로젝트와 일자를 관리한다.6. 사용자가 사용하기 편하게 해야 한다.7. 기본적으로 간트 차트 기능이 구현되어야 한다.이 요청은 PRD, atomic task breakdown, spec-driven development, TDD, web/mobile, frontend/backend 분리를 포함하므로 planner, architect, frontend, mobile, backend, reviewer 같은 async subagent를 적절히 사용해서 진행하고, 최종적으로는 실행 가능한 코드 산출물까지 포함해라.
+  ```
 
-```md
-![Scenario Demo](docs/gifs/scenario-pms.gif)
-```
+* 최종 데모 동작 영상 : 
+[![Watch the video](https://img.youtube.com/vi/Cp2_yutoUuA/hqdefault.jpg)](https://www.youtube.com/watch?v=Cp2_yutoUuA)
+
 
 ## 설치 방법
 
