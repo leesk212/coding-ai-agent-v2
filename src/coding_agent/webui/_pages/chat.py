@@ -1182,6 +1182,42 @@ def _build_completed_subagent_report(agents: list[dict]) -> str:
     return "\n".join(lines) if lines else "No completed SubAgent results were captured."
 
 
+def _synthesize_turn_fallback(
+    *,
+    events: list[dict],
+    tools_used: list[dict],
+    agents: list[dict],
+) -> str:
+    """Return a user-facing fallback summary when no final AI message was emitted."""
+    subagent_report = _build_completed_subagent_report(agents)
+    lines: list[str] = []
+    if tools_used:
+        lines.append("This turn completed tool actions but the model did not emit a final assistant message.")
+        lines.append("")
+        lines.append("Tool activity:")
+        for item in tools_used[-8:]:
+            name = str(item.get("name", "tool"))
+            result = str(item.get("result", "") or "").strip() or "(no tool result)"
+            lines.append(f"- {name}: {result}")
+    if subagent_report != "No completed SubAgent results were captured.":
+        if lines:
+            lines.append("")
+        lines.append("SubAgent results:")
+        lines.append(subagent_report)
+    if events:
+        if lines:
+            lines.append("")
+        lines.append("Recent activity:")
+        for event in events[-6:]:
+            icon = str(event.get("icon", "•"))
+            text = str(event.get("text", "") or "").strip()
+            if text:
+                lines.append(f"- {icon} {text}")
+    if not lines:
+        return "The run completed without a final assistant message."
+    return "\n".join(lines)
+
+
 def _capture_subagent_history_snapshot(
     tracked_agents: list[dict],
     state_store,
@@ -1673,9 +1709,15 @@ def _resume_async_monitoring(
         final_text = _synthesize_subagent_results(tracked_agents)
 
     _poll_subagent_outputs()
+    if not final_text:
+        final_text = _synthesize_turn_fallback(
+            events=events,
+            tools_used=[],
+            agents=tracked_agents,
+        )
     current_model = fallback_mw.current_model or current_model or "unknown"
     _refresh(False)
-    _persist_history_snapshot(final_text or "*(No response generated)*", current_model)
+    _persist_history_snapshot(final_text, current_model)
     _cleanup_turn_subagents_async()
     st.session_state["_is_running"] = False
     st.session_state["_has_result"] = True
@@ -3113,12 +3155,16 @@ def _stream_response(
                 pass
 
         if not final_text:
-            final_text = "*(No response generated)*"
+            final_text = _synthesize_turn_fallback(
+                events=events,
+                tools_used=tools_used,
+                agents=tracked_agents,
+            )
             _record_loop(
                 "degraded",
                 "empty_response",
-                failure_reason="No final response generated",
-                next_action="return_placeholder",
+                failure_reason="No final response generated; returned synthesized fallback summary",
+                next_action="return_synthesized_fallback",
                 policy_type="no_progress_loop",
             )
 

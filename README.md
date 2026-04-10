@@ -7,6 +7,88 @@
 2. 동적으로 생성되고 정리되는 SubAgent 수명주기 관리
 3. Agentic loop의 복원력과 안전성
 
+## 빠른 목차
+
+- [실행 방법](#실행-방법)
+- [데모 GIF](#데모-gif)
+- [평가 기준 대응](#평가-기준-대응)
+- [핵심 산출물 요약](#핵심-산출물-요약)
+- [현재 구조](#현재-구조)
+- [가장 먼저 볼 파일](#가장-먼저-볼-파일)
+- [Agent 설정은 어디서 하나](#agent-설정은-어디서-하나)
+- [현재 SubAgent 역할](#현재-subagent-역할)
+- [SubAgent는 언제 실제로 뜨나](#subagent는-언제-실제로-뜨나)
+- [SubAgent 프로세스 내부](#subagent-프로세스-내부)
+- [사용자 질의 1개가 처리되는 방식](#사용자-질의-1개가-처리되는-방식)
+- [장기 메모리 설계](#장기-메모리-설계)
+- [Remember Agent + Human in the Loop](#remember-agent--human-in-the-loop)
+- [동적 SubAgent 수명주기 관리](#동적-subagent-수명주기-관리)
+- [Agentic Loop 복원력과 안전성](#agentic-loop-복원력과-안전성)
+- [모델 정책](#모델-정책)
+- [WebUI 핵심 기능](#webui-핵심-기능)
+- [테스트 프롬프트와 시나리오](#테스트-프롬프트와-시나리오)
+- [Docker 실행](#docker-실행)
+- [검증 방법](#검증-방법)
+
+## 실행 방법
+
+### 로컬 실행
+
+```bash
+cd /mnt/c/Users/SDS/Subject
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+python -m coding_agent
+```
+
+브라우저:
+
+- `http://localhost:8501`
+
+초기 진입 흐름:
+
+1. WebUI 접속
+2. `OpenRouter API Key` 입력
+3. 필요하면 `Fallback` 설정
+4. `Start Danny's Chat`
+5. DeepAgents runtime initialize
+6. Chat 진입
+
+### Docker 실행
+
+```bash
+docker compose up --build
+```
+
+또는 이미 올린 이미지 사용:
+
+```bash
+docker run -p 8501:8501 --env-file .env leesk212/coding-ai-agent-v2:latest
+```
+
+## 데모 GIF
+
+아래 3개 동작 화면을 이 섹션에 배치하면 된다.
+
+### 1. Hello
+
+```md
+![Hello Demo](docs/gifs/hello.gif)
+```
+
+### 2. Code+Review
+
+```md
+![Code+Review Demo](docs/gifs/code-review.gif)
+```
+
+### 3. Scenario (PMS시스템구성)
+
+```md
+![Scenario Demo](docs/gifs/scenario-pms.gif)
+```
+
 ## 평가 기준 대응
 
 ### 1. 요구사항 구현 (10점)
