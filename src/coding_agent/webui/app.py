@@ -53,6 +53,8 @@ def _init_state():
         "prewarm_state": None,
         "prewarm_bundle": None,
         "startup_setup_complete": False,
+        "startup_openrouter_key": "",
+        "startup_openai_key": "",
         "_conversation_thread_id": f"webui-{uuid.uuid4().hex}",
     }
     for k, v in defaults.items():
@@ -193,7 +195,7 @@ def _render_startup_setup(area=None) -> None:
             st.subheader("Model Access")
             openrouter_key = st.text_input(
                 "OpenRouter API Key",
-                value=settings.openrouter_api_key or "",
+                value=st.session_state.get("startup_openrouter_key", ""),
                 type="password",
                 help="Required. Danny's Chat will not initialize before this is set.",
             )
@@ -222,7 +224,7 @@ def _render_startup_setup(area=None) -> None:
             elif fallback_mode == "openai":
                 openai_key = st.text_input(
                     "OpenAI API Key",
-                    value=settings.openai_api_key or "",
+                    value=st.session_state.get("startup_openai_key", ""),
                     type="password",
                     help="Required when fallback is OpenAI.",
                 )
@@ -242,6 +244,9 @@ def _render_startup_setup(area=None) -> None:
             submitted = st.form_submit_button("Start Danny's Chat", type="primary", use_container_width=True)
 
         if not submitted:
+            st.session_state["startup_openrouter_key"] = openrouter_key
+            if fallback_mode == "openai":
+                st.session_state["startup_openai_key"] = openai_key
             _prewarm_status_fragment()
             st.info("OpenRouter API key is required. DeepAgents prewarm is running in parallel.")
             st.stop()
@@ -261,6 +266,8 @@ def _render_startup_setup(area=None) -> None:
             openai_key=openai_key,
             openai_model=openai_model,
         )
+        st.session_state["startup_openrouter_key"] = ""
+        st.session_state["startup_openai_key"] = ""
         st.session_state.startup_setup_complete = True
         st.session_state.agent_components = None
         st.session_state.initialized = False

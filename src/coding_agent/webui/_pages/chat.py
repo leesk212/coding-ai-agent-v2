@@ -374,14 +374,33 @@ def _render_live_remember_review() -> None:
         return
     candidates = review.get("candidates") or []
     workdir = str(review.get("workdir", "") or "")
+    st.markdown("<div id='hitl-remember-review-anchor'></div>", unsafe_allow_html=True)
     st.markdown(
-        "<div style='background:#fff7ed;border:1px solid #fdba74;border-radius:14px;padding:12px 14px;margin:10px 0'>"
-        "<div style='font-size:.88em;font-weight:700;color:#9a3412;margin-bottom:6px'>Human In the Loop · Remember Review</div>"
-        "<div style='font-size:.82em;color:#9a3412'>The remember subagent paused this turn for approval. "
-        "Review the nominated files, approve the ones that should become long-term memory, then continue the same session.</div>"
+        "<div class='hitl-review-card'>"
+        "<div class='hitl-review-title'>Action Required · Human In The Loop</div>"
+        "<div class='hitl-review-text'>The remember subagent paused this turn for approval. "
+        "Review the nominated files, approve the ones that should become long-term memory, then continue the same session. "
+        "The final Main Agent answer is intentionally being held until this decision is completed.</div>"
         "</div>",
         unsafe_allow_html=True,
     )
+    if st.session_state.pop("_hitl_scroll_pending", False):
+        components.html(
+            """
+            <script>
+            const scrollToAnchor = () => {
+              const anchor = window.parent.document.getElementById('hitl-remember-review-anchor');
+              if (anchor) {
+                anchor.scrollIntoView({behavior: 'smooth', block: 'center'});
+              }
+            };
+            setTimeout(scrollToAnchor, 50);
+            setTimeout(scrollToAnchor, 250);
+            </script>
+            """,
+            height=0,
+            scrolling=False,
+        )
     if workdir:
         st.caption(f"Workspace: {workdir}")
     if not candidates:
@@ -1234,6 +1253,7 @@ def _resume_async_monitoring(
             "events": list(events),
             "agents": _capture_subagent_history_snapshot(tracked_agents, state_store),
             "working": working,
+            "hold_final_answer": bool(tracked_agents) or bool(st.session_state.get("_pending_human_review")),
         }
 
     def _evt(icon: str, text: str, css: str = "") -> None:
@@ -1480,6 +1500,7 @@ def _resume_async_monitoring(
             "workdir": working_dir,
             "candidates": candidates,
         }
+        st.session_state["_hitl_scroll_pending"] = True
         _sync_live(True)
         st.rerun()
         return True
@@ -1714,6 +1735,7 @@ def _stream_response(
             "events": list(events),
             "agents": _capture_subagent_history_snapshot(_agents_state(), state_store),
             "working": working,
+            "hold_final_answer": bool(tracked_agents) or bool(st.session_state.get("_pending_human_review")),
         }
 
     def _clear_live_turn_state() -> None:
@@ -2420,6 +2442,7 @@ def _stream_response(
             "workdir": working_dir,
             "candidates": candidates,
         }
+        st.session_state["_hitl_scroll_pending"] = True
         st.session_state["_monitor_async_after_answer"] = True
         _sync_live_turn_state(working=True)
         st.rerun()
@@ -2788,7 +2811,10 @@ def _stream_response(
                                 "done",
                                 refresh=False,
                             )
-                            _render_agent_answer(final_text, current_model)
+                            if tracked_agents or launched_async:
+                                _render_agent_status("SubAgent results are still running. Final answer will be released after the remember review.")
+                            else:
+                                _render_agent_answer(final_text, current_model)
                             _refresh(True if tracked_agents else False, result=final_text, model=current_model)
 
                     elif msg_type == "tool":
@@ -3248,6 +3274,27 @@ def render_chat() -> None:
         color: #6b7280;
         margin-top: 8px;
     }
+    .hitl-review-card {
+        background: linear-gradient(135deg, rgba(127,29,29,.08), rgba(249,115,22,.12));
+        border: 2px solid rgba(220,38,38,.45);
+        border-radius: 16px;
+        padding: 14px 16px;
+        margin: 12px 0;
+        box-shadow: 0 8px 24px rgba(220,38,38,.12);
+    }
+    .hitl-review-title {
+        font-size: .92em;
+        font-weight: 800;
+        color: #991b1b;
+        letter-spacing: .35px;
+        margin-bottom: 6px;
+        text-transform: uppercase;
+    }
+    .hitl-review-text {
+        font-size: .84em;
+        color: #7f1d1d;
+        line-height: 1.55;
+    }
     div[data-testid="stExpander"] {
         border: 1px solid #bbf7d0;
         border-radius: 16px;
@@ -3314,7 +3361,7 @@ def render_chat() -> None:
                 )
                 msg_workdir = str(msg.get("working_dir", "") or "")
                 if msg_workdir and st.toggle(
-                    "Workspace",
+                    "Download Workspace",
                     key=f"_show_workspace_hist_{_assistant_idx}",
                     value=False,
                 ):
@@ -3478,11 +3525,21 @@ def render_chat() -> None:
             result_ph_ref["ph"] = st.empty()
             live_result = str(live_turn.get("result_text", "") or "")
             live_model = str(live_turn.get("model", "") or "")
+            hold_final_answer = bool(live_turn.get("hold_final_answer", False))
             live_model_html = (
                 f"<div class='agent-bubble-model'>🧠 {_escape_html(live_model)}</div>"
                 if live_model else ""
             )
-            if live_result:
+            if hold_final_answer:
+                hold_text = "SubAgent execution and Remember review are still in progress. Final answer will appear after approval."
+                result_ph_ref["ph"].markdown(
+                    f"{_bubble_wrap_open('agent')}<div class='agent-bubble' style='{_bubble_width_style(hold_text, 'agent')}'>"
+                    f"{_escape_bubble_html(hold_text)}"
+                    "<div class='agent-bubble-model'>Waiting for Human In the Loop</div>"
+                    "</div></div>",
+                    unsafe_allow_html=True,
+                )
+            elif live_result:
                 result_ph_ref["ph"].markdown(
                     f"{_bubble_wrap_open('agent')}<div class='agent-bubble' style='{_bubble_width_style(live_result, 'agent')}'>"
                     f"{_escape_bubble_html(live_result)}"
