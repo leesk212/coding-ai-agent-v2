@@ -43,11 +43,12 @@
 ![hello](https://github.com/user-attachments/assets/f737c7fc-4a92-4f5d-8502-763666148725)
 
 
-### 2. Code+Review
+### 2. Code+Review (SubAgents)
+* SubAgents
+[![Watch the video](https://img.youtube.com/vi/P3aDKMqmR_4/hqdefault.jpg)](https://www.youtube.com/watch?v=P3aDKMqmR_4)
+* Memory Check
+  ![code+memory](https://github.com/user-attachments/assets/4fb50a1f-507e-4f1e-8d4b-c67f16aa5034)
 
-```md
-![Code+Review Demo](docs/gifs/code-review.gif)
-```
 
 ### 3. Scenario (PMS시스템구성)
 
