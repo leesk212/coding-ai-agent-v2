@@ -1,5 +1,6 @@
 """Danny's Coding AI Agent — Single-page WebUI."""
 
+import copy
 import logging
 import os
 import threading
@@ -55,6 +56,8 @@ def _init_state():
         "startup_setup_complete": False,
         "startup_openrouter_key": "",
         "startup_openai_key": "",
+        "_chat_history_cache": [],
+        "_nav_transition": None,
         "_conversation_thread_id": f"webui-{uuid.uuid4().hex}",
     }
     for k, v in defaults.items():
@@ -68,6 +71,7 @@ def _reset_chat_state() -> None:
     st.session_state["_is_running"] = False
     st.session_state["_has_result"] = False
     st.session_state["chat_messages"] = []
+    st.session_state["_chat_history_cache"] = []
     st.session_state["_prompt_area"] = ""
     st.session_state["_clear_prompt"] = True
     st.session_state["_conversation_thread_id"] = f"webui-{uuid.uuid4().hex}"
@@ -309,6 +313,7 @@ def _init_agent(area=None):
             log("🧪", f"Models: {len(models)} configured", 20)
             log("🪂", f"Fallback mode: {settings.fallback_mode}", 21)
             log("📂", f"Working directory: {Path.cwd()}", 22)
+            log("💬", f"Restoring chat history: {len(st.session_state.get('chat_messages', []))} messages", 23)
             log("🗃️", f"Memory directory: {settings.memory_dir}", 24)
             log("🗄️", f"State store path: {settings.state_dir / 'agent_state.db'}", 26)
             primary_model = getattr(settings, "primary_model_string", "") or "unknown"
@@ -414,16 +419,58 @@ def _init_agent(area=None):
         st.rerun()
 
 
+def _mark_navigation(target_page: str) -> None:
+    current = str(st.session_state.get("page", "chat"))
+    if current == target_page:
+        return
+    st.session_state["_nav_transition"] = {
+        "from": current,
+        "to": target_page,
+        "started_at": time.time(),
+    }
+
+
+def _render_navigation_status(target_page: str) -> None:
+    nav = st.session_state.get("_nav_transition")
+    if not nav or str(nav.get("to")) != target_page:
+        return
+    elapsed = time.time() - float(nav.get("started_at", time.time()))
+    labels = {
+        "chat": "Restoring Chat",
+        "settings": "Opening Settings",
+        "memory": "Opening Memory",
+    }
+    title = labels.get(target_page, "Loading")
+    st.markdown(
+        "<div style='background:#f8fafc;border:1px solid #cbd5e1;border-radius:14px;padding:10px 12px;margin-bottom:12px'>"
+        f"<div style='font-size:.82em;font-weight:700;color:#334155'>{title}</div>"
+        f"<div style='font-size:.78em;color:#64748b;margin-top:4px'>"
+        f"from={nav.get('from', '?')} → to={nav.get('to', '?')} · elapsed={elapsed:.1f}s"
+        "</div>"
+        "<div style='font-size:.78em;color:#475569;margin-top:6px'>"
+        "Rehydrating session state, restoring prior chat history, and rendering the destination page."
+        "</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def main():
     _init_state()
+
+    if st.session_state.get("chat_messages"):
+        st.session_state["_chat_history_cache"] = copy.deepcopy(st.session_state["chat_messages"])
 
     # ── query_params 로 페이지 전환 감지 ─────────────────────────────
     qp = st.query_params
     if qp.get("page") == "settings" and st.session_state.page != "settings":
+        _mark_navigation("settings")
         st.session_state.page = "settings"
     elif qp.get("page") == "memory" and st.session_state.page != "memory":
+        _mark_navigation("memory")
         st.session_state.page = "memory"
     elif qp.get("page") == "chat" and st.session_state.page != "chat":
+        _mark_navigation("chat")
         st.session_state.page = "chat"
     if qp.get("refresh") == "1":
         _reset_chat_state()
@@ -435,8 +482,10 @@ def main():
     # ── Page routing ─────────────────────────────────────────────────
     page = st.session_state.page
     if page == "settings":
+        _render_navigation_status("settings")
         from coding_agent.webui._pages.settings import render_settings
         render_settings()
+        st.session_state["_nav_transition"] = None
         st.markdown(
             '<div style="position:fixed;bottom:1rem;left:1.2rem;display:flex;gap:.9rem;align-items:center;z-index:9999;">'
             '<a href="?page=chat" target="_self" style="font-size:0.85rem;color:#64748b;text-decoration:none;">Back to Chat</a>'
@@ -445,8 +494,10 @@ def main():
             unsafe_allow_html=True,
         )
     elif page == "memory":
+        _render_navigation_status("memory")
         from coding_agent.webui._pages.memory import render_memory
         render_memory()
+        st.session_state["_nav_transition"] = None
         st.markdown(
             '<div style="position:fixed;bottom:1rem;left:1.2rem;display:flex;gap:.9rem;align-items:center;z-index:9999;">'
             '<a href="?page=chat" target="_self" style="font-size:0.85rem;color:#64748b;text-decoration:none;">Back to Chat</a>'
@@ -455,6 +506,9 @@ def main():
             unsafe_allow_html=True,
         )
     else:
+        if not st.session_state.get("chat_messages") and st.session_state.get("_chat_history_cache"):
+            st.session_state["chat_messages"] = copy.deepcopy(st.session_state["_chat_history_cache"])
+        _render_navigation_status("chat")
         startup_area = st.empty()
         if not st.session_state.startup_setup_complete:
             _render_startup_setup(startup_area)
@@ -466,6 +520,7 @@ def main():
 
         from coding_agent.webui._pages.chat import render_chat
         render_chat()
+        st.session_state["_nav_transition"] = None
         # Chat 페이지 좌측 하단에 Settings/Refresh 링크
         st.markdown(
             '<div style="position:fixed;bottom:1rem;left:1.2rem;'

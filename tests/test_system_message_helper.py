@@ -4,10 +4,20 @@ import unittest
 
 from langchain_core.messages import SystemMessage
 
+from coding_agent.agent import BASE_SYSTEM_PROMPT
 from coding_agent.middleware._system_message import append_system_message
 
 
 class SystemMessageHelperTests(unittest.TestCase):
+    def test_base_system_prompt_requires_memory_extraction(self) -> None:
+        prompt = BASE_SYSTEM_PROMPT
+        self.assertIn("long-term memory extraction path", prompt)
+        self.assertIn("user/profile", prompt)
+        self.assertIn("project/context", prompt)
+        self.assertIn("domain/knowledge", prompt)
+        self.assertIn("memory_store", prompt)
+        self.assertIn("memory_search", prompt)
+
     def test_append_preserves_system_message_object(self) -> None:
         current = SystemMessage(content="BASE")
 

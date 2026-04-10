@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware
@@ -37,7 +38,8 @@ class LazyAsyncSubagentsMiddleware(AgentMiddleware):
             return None
 
         task_summary = str(args.get("description", "") or "").strip()
-        root_dir = str(self._runtime.root_dir)
+        original_task_summary = task_summary
+        root_dir = str(getattr(self._runtime, "root_dir", Path.cwd()))
         if task_summary:
             args["description"] = (
                 f"{task_summary}\n\n"
@@ -46,20 +48,19 @@ class LazyAsyncSubagentsMiddleware(AgentMiddleware):
                 f"- Use absolute paths rooted under {root_dir}\n"
                 "- If you create or review files, inspect this directory first.\n"
             )
-            task_summary = str(args["description"])
-        self._runtime.begin_task(subagent_type, task_summary or "(no task summary)")
+        self._runtime.begin_task(subagent_type, original_task_summary or "(no task summary)")
         try:
             self._runtime.ensure_started(subagent_type)
             self._runtime.note_runtime_state(
                 subagent_type,
                 state="running",
-                task_summary=task_summary,
+                task_summary=original_task_summary,
             )
         except Exception as exc:  # noqa: BLE001
             self._runtime.note_runtime_state(
                 subagent_type,
                 state="failed",
-                task_summary=task_summary,
+                task_summary=original_task_summary,
                 error=str(exc),
             )
             return ToolMessage(

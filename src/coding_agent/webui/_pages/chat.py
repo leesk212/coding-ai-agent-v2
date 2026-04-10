@@ -82,7 +82,7 @@ TEST_PROMPTS = {
         "created -> assigned -> running -> completed/destroyed 를 요약해라."
     ),
     "Code+Review Test": (
-        "Handle this in one user turn. You must use async subagents via `start_async_task`. "
+        "Handle this in one user turn. You must use async subagents via `start_async_task` and launch two async tasks. "
         "First launch a coder subagent to implement a fibonacci function "
         "with type hints and save it to a concrete Python file in the current query workspace. "
         "After the coder completes and the file path is known, launch a reviewer subagent to review "
@@ -630,6 +630,15 @@ def _analysis_column_weights(text: str) -> list[float]:
     return [float(width), float(max(8, 100 - width))]
 
 
+def _sort_agents_for_display(rows: list[dict]) -> list[dict]:
+    def _sort_key(row: dict) -> tuple[float, float]:
+        last_progress = float(row.get("last_progress_at") or 0.0)
+        started = float(row.get("started_at") or 0.0)
+        return (last_progress, started)
+
+    return sorted(rows, key=_sort_key, reverse=True)
+
+
 def _edge_label(text: str, fallback: str, limit: int = 28) -> str:
     """Return a short Mermaid-safe edge label."""
     safe_text = _clean_label_text(text or "")
@@ -656,6 +665,7 @@ def _build_mermaid(
     prompt_text: str = "",
     result_text: str = "",
     model_name: str = "",
+    human_waiting: bool = False,
 ) -> tuple[str, dict[str, str]]:
     """Return a (mermaid_definition, tooltips) tuple.
 
@@ -679,6 +689,8 @@ def _build_mermaid(
         if model_name:
             safe_model = _esc(model_name[:20])
             m_detail += f" {safe_model}"
+    elif human_waiting:
+        m_detail = "Waiting for Human Review"
     elif is_working:
         m_detail = "Processing"
     else:
@@ -729,6 +741,11 @@ def _build_mermaid(
             error_label = _edge_label(a.get("result_summary", ""), "failed")
             lines.append(f'    {nid} -.->|"{error_label}"| M')
 
+    if human_waiting:
+        lines.append('    H["Human Review<br/><small>Waiting for approval</small>"]')
+        lines.append('    U -.->|"approval decision"| H')
+        lines.append('    H -.->|"resume session"| M')
+
     # ── Main Agent → User (완료 시) ──────────────────────
     if has_result:
         response_label = _edge_label(result_text, "response", limit=32)
@@ -754,6 +771,11 @@ def _build_mermaid(
             "    style M fill:#f0fdf4,stroke:#22c55e,"
             "stroke-width:2px,color:#166534"
         )
+    if human_waiting:
+        lines.append(
+            "    style H fill:#fff7ed,stroke:#ea580c,"
+            "stroke-width:3px,color:#9a3412"
+        )
 
     _STATUS_STYLE = {
         "pending":   "fill:#fffbeb,stroke:#f59e0b,stroke-width:2px,color:#92400e",
@@ -772,6 +794,8 @@ def _build_mermaid(
     if is_working and not has_result:
         active_nodes.append("M")
     active_nodes.extend(f"S{i}" for i, a in enumerate(agents) if a["status"] == "running")
+    if human_waiting:
+        active_nodes.append("H")
     if active_nodes:
         lines.append(f"    class {','.join(active_nodes)} activeNode")
 
@@ -784,6 +808,9 @@ def _build_mermaid(
     if result_text:
         response_label = _edge_label(result_text, "response", limit=32)
         _add_tooltip(tooltips, response_label, result_text)
+    if human_waiting:
+        _add_tooltip(tooltips, "approval decision", "Human approval is required before the Main Agent can produce the final answer.")
+        _add_tooltip(tooltips, "resume session", "After approve/reject, the same session resumes and final aggregation continues.")
     for i, a in enumerate(agents):
         prompt_label = _edge_label(a.get("query", ""), f"{a['type']} task")
         if a.get("query"):
@@ -1270,6 +1297,7 @@ def _resume_async_monitoring(
             prompt,
             result_text=final_text,
             model_name=current_model,
+            human_waiting=bool(st.session_state.get("_pending_human_review")),
         )
         _render_mermaid(graph_ph, mermaid_def, events, working, num_agents=len(agents), tooltips=tips)
 
@@ -1300,7 +1328,7 @@ def _resume_async_monitoring(
                     "<div style='font-size:.78em;font-weight:700;color:#64748b;letter-spacing:.35px;margin-bottom:6px'>"
                     "SubAgent Streaming Output</div>"
                 ]
-                for row in rows:
+                for row in _sort_agents_for_display(rows):
                     endpoint = row.get("endpoint") or ""
                     pid = row.get("pid")
                     model = row.get("model") or ""
@@ -1842,7 +1870,7 @@ def _stream_response(
             "<div style='font-size:.78em;font-weight:700;color:#64748b;letter-spacing:.35px;margin-bottom:6px'>"
             "SubAgent Streaming Output</div>"
         ]
-        for row in rows:
+        for row in _sort_agents_for_display(rows):
             endpoint = row.get("endpoint") or ""
             pid = row.get("pid")
             model = row.get("model") or ""
@@ -3213,6 +3241,7 @@ def render_chat() -> None:
     if preset_prompt is not None:
         st.session_state["_prompt_area"] = preset_prompt
     live_turn = st.session_state.get("_live_turn_state") or {}
+    hide_prompt_panels = bool(pending or is_running or live_turn)
 
     # ── Page-level CSS ────────────────────────────────────
     st.markdown("""
@@ -3295,6 +3324,28 @@ def render_chat() -> None:
         color: #7f1d1d;
         line-height: 1.55;
     }
+    .analysis-focus-shell {
+        border: 1px solid rgba(59, 130, 246, 0.26);
+        border-radius: 18px;
+        padding: 10px 12px 12px;
+        margin: 8px 0 12px;
+        background: linear-gradient(180deg, rgba(248,250,252,0.96), rgba(239,246,255,0.88));
+        box-shadow: 0 10px 26px rgba(59, 130, 246, 0.08), inset 0 0 0 1px rgba(255,255,255,0.55);
+    }
+    .analysis-focus-title {
+        font-size: .76em;
+        font-weight: 800;
+        color: #1d4ed8;
+        letter-spacing: .35px;
+        margin-bottom: 6px;
+        text-transform: uppercase;
+    }
+    .prompt-controls-shell {
+        margin-top: 2px;
+    }
+    .prompt-controls-hidden {
+        display: none !important;
+    }
     div[data-testid="stExpander"] {
         border: 1px solid #bbf7d0;
         border-radius: 16px;
@@ -3309,6 +3360,11 @@ def render_chat() -> None:
 
     # ── Determine conversation state ─────────────────────
     has_conversation = bool(st.session_state.chat_messages) or pending or is_running or bool(live_turn)
+    history_messages = list(st.session_state.chat_messages)
+    if (pending or is_running or live_turn) and history_messages:
+        last_msg = history_messages[-1]
+        if last_msg.get("role") == "user":
+            history_messages = history_messages[:-1]
 
     # ── 1. Main content area ─────────────────────────────
     graph_ph = st.empty()
@@ -3337,11 +3393,11 @@ def render_chat() -> None:
         # Layout: Agent answer → Mermaid analysis → User prompt.
         _last_user_content = ""
         _assistant_total = sum(
-            1 for msg in st.session_state.chat_messages
+            1 for msg in history_messages
             if msg["role"] == "assistant"
         )
         _assistant_idx = 0
-        for msg in st.session_state.chat_messages:
+        for msg in history_messages:
             if msg["role"] == "user":
                 _last_user_content = msg["content"]
 
@@ -3469,6 +3525,14 @@ def render_chat() -> None:
                         key=f"_show_analysis_hist_{_assistant_idx}",
                         value=_is_latest_assistant,
                     ):
+                        st.markdown(
+                            "<div class='analysis-focus-shell'>"
+                            "<div class='analysis-focus-title'>Focused Analysis View</div>"
+                            "<div style='font-size:.78em;color:#475569;margin-bottom:8px'>"
+                            "Mermaid flow, event timeline, and subagent completion context are grouped here."
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
                         components.html(_hist_html, height=_h, scrolling=True)
                         _history = msg.get("subagent_history_snapshot") or []
                         aggregated_report = str(msg.get("aggregated_subagent_report", "") or "").strip()
@@ -3505,6 +3569,7 @@ def render_chat() -> None:
                                     "</div>",
                                     unsafe_allow_html=True,
                                 )
+                        st.markdown("</div>", unsafe_allow_html=True)
 
                 st.markdown(
                     f"<div class='user-bubble-label'>👤 User</div>"
@@ -3556,6 +3621,14 @@ def render_chat() -> None:
                 )
 
             if st.toggle("Agent 동작 분석", key="_show_analysis_live", value=True):
+                st.markdown(
+                    "<div class='analysis-focus-shell'>"
+                    "<div class='analysis-focus-title'>Focused Analysis View</div>"
+                    "<div style='font-size:.78em;color:#475569;margin-bottom:8px'>"
+                    "Mermaid flow, live event timeline, Human In the Loop, and SubAgent streaming are grouped here."
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
                 graph_ph = st.empty()
                 live_agents = live_turn.get("agents") or []
                 live_events = live_turn.get("events") or []
@@ -3567,6 +3640,7 @@ def render_chat() -> None:
                     live_prompt,
                     result_text=live_result if not live_working else "",
                     model_name=live_model,
+                    human_waiting=bool(st.session_state.get("_pending_human_review")),
                 )
                 _render_mermaid(
                     graph_ph,
@@ -3577,6 +3651,7 @@ def render_chat() -> None:
                     tooltips=tips,
                 )
 
+                _render_live_remember_review()
                 subagent_ph_ref["ph"] = st.empty()
                 if live_agents:
                     parts = [
@@ -3584,7 +3659,7 @@ def render_chat() -> None:
                         "<div style='font-size:.78em;font-weight:700;color:#64748b;letter-spacing:.35px;margin-bottom:6px'>"
                         "SubAgent Streaming Output</div>"
                     ]
-                    for row in live_agents:
+                    for row in _sort_agents_for_display(live_agents):
                         endpoint = row.get("endpoint") or ""
                         pid = row.get("pid")
                         model = row.get("model") or ""
@@ -3604,8 +3679,7 @@ def render_chat() -> None:
                     subagent_ph_ref["ph"].markdown("".join(parts), unsafe_allow_html=True)
                 else:
                     subagent_ph_ref["ph"] = st.empty()
-
-                _render_live_remember_review()
+                st.markdown("</div>", unsafe_allow_html=True)
 
             prompt_display = live_prompt or pending or "(processing…)"
             st.markdown(
@@ -3635,7 +3709,9 @@ def render_chat() -> None:
         st.session_state["_pending_prompt"] = raw
         st.session_state["_clear_prompt"] = True
 
+    prompt_controls_class = "prompt-controls-shell prompt-controls-hidden" if hide_prompt_panels else "prompt-controls-shell"
     with bottom_controls.container():
+        st.markdown(f"<div class='{prompt_controls_class}'>", unsafe_allow_html=True)
         st.markdown(
             "<hr style='border:none;border-top:1px solid #e2e8f0;margin:16px 0 8px'>",
             unsafe_allow_html=True,
@@ -3761,6 +3837,7 @@ def render_chat() -> None:
                 disabled=is_running,
                 type="primary",
             )
+        st.markdown("</div>", unsafe_allow_html=True)
 
     if send_clicked:
         _queue_current_prompt()
