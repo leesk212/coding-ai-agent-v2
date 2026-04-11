@@ -610,8 +610,9 @@ leesk212/coding-ai-agent-v5:latest
 
 주의:
 
-- 루트에서 `pytest -q`를 바로 실행하면 vendored `deepagents_sourcecode/libs/evals/tests/...`까지 수집될 수 있다
+- 루트에서 `pytest -q`를 바로 실행하면 `ETC/deepagents_sourcecode/libs/evals/tests/...` 같은 외부 참조용 벤더드 테스트까지 수집될 수 있다
 - 현재 프로젝트 검증 기준은 `pytest tests` 범위가 맞다
+- `ETC/`에는 참고용 문서 초안/데모 산출물/벤더드 소스코드가 들어 있으며, 애플리케이션 실행에는 사용되지 않는다
 
 ## 최근 주요 업데이트 요약
 
